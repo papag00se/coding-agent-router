@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .compaction_transport import compaction_payload_fields, record_transport_event
 from .compat import (
     anthropic_request_from_ollama_chat,
     anthropic_request_from_openai_chat,
@@ -28,6 +30,7 @@ from .app_server import CodexAppServerBridge
 app = FastAPI(title="Local Agent Router Starter", version="0.1.0")
 service = RoutingService()
 app_server = CodexAppServerBridge(service)
+_TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
 
 
 @app.get("/health")
@@ -64,15 +67,36 @@ def invoke(req: InvokeRequest):
 
 @app.post("/internal/compact")
 def compact(req: CompactRequest):
-    return JSONResponse(
-        service.compact_session(
-            req.session_id,
-            req.items,
-            current_request=req.current_request,
-            repo_context=req.repo_context,
-            refresh_if_needed=req.refresh_if_needed,
-        )
+    record_transport_event(
+        _TRANSPORT_LOG_PATH,
+        'internal_compact_start',
+        session_id=req.session_id,
+        refresh_if_needed=req.refresh_if_needed,
+        **compaction_payload_fields(
+            before={
+                'session_id': req.session_id,
+                'items': req.items,
+                'current_request': req.current_request,
+                'repo_context': req.repo_context,
+                'refresh_if_needed': req.refresh_if_needed,
+            }
+        ),
     )
+    handoff = service.compact_session(
+        req.session_id,
+        req.items,
+        current_request=req.current_request,
+        repo_context=req.repo_context,
+        refresh_if_needed=req.refresh_if_needed,
+    )
+    record_transport_event(
+        _TRANSPORT_LOG_PATH,
+        'internal_compact_completed',
+        session_id=req.session_id,
+        refresh_if_needed=req.refresh_if_needed,
+        **compaction_payload_fields(after=handoff),
+    )
+    return JSONResponse(handoff)
 
 
 @app.post("/v1/messages")

@@ -214,6 +214,8 @@ Transport logging is appended to:
 
 - `state/compaction_transport.jsonl`
 
+When `LOG_COMPACTION_PAYLOADS=true`, the transport log also includes full before/after compaction payload bodies for compaction operations.
+
 ### Local Deployment Artifacts
 
 Operational helpers are included for:

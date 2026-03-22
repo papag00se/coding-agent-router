@@ -30,10 +30,13 @@
 - `COMPACTOR_MERGE_BATCH_SIZE`
 - `COMPACTION_STATE_DIR`
 - `ENABLE_INCREMENTAL_COMPACTION`
+- `LOG_COMPACTION_PAYLOADS`
 - `INLINE_COMPACT_SENTINEL`
 - `OPENAI_PASSTHROUGH_BASE_URL`
 
 `OPENAI_PASSTHROUGH_BASE_URL` is the hosted Codex/OpenAI upstream that ordinary non-compaction traffic is proxied to when the compaction router is used as an OAuth proxy. In ChatGPT-auth mode, that should normally be `https://chatgpt.com/backend-api/codex`, not `https://api.openai.com/v1`.
+
+`LOG_COMPACTION_PAYLOADS=true` adds full before/after compaction payloads to `state/compaction_transport.jsonl`. Leave it off unless you explicitly want that data on disk.
 
 ## Routing toggles
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import time
 import uuid
@@ -12,20 +11,16 @@ from typing import Any, Dict, List, Optional
 from fastapi import WebSocket
 from starlette.concurrency import run_in_threadpool
 
+from .compaction_transport import compaction_payload_fields, record_transport_event
 from .config import settings
 from .models import AnthropicMessagesRequest
 from .prompt_loader import render_prompt
 
-logger = logging.getLogger(__name__)
 _TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
 
 
 def _record_transport_event(event: str, **fields: Any) -> None:
-    payload = {'event': event, **fields}
-    _TRANSPORT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _TRANSPORT_LOG_PATH.open('a', encoding='utf-8') as fh:
-        fh.write(json.dumps(payload, ensure_ascii=False) + '\n')
-    logger.warning('compaction_transport %s', json.dumps(payload, ensure_ascii=False))
+    record_transport_event(_TRANSPORT_LOG_PATH, event, **fields)
 
 
 def _now() -> int:
@@ -297,6 +292,15 @@ class CodexAppServerBridge:
             mode=self.mode,
             items=len(items),
             cwd=state.cwd,
+            **compaction_payload_fields(
+                before={
+                    'session_id': thread_id,
+                    'items': items,
+                    'current_request': current_request,
+                    'repo_context': repo_context,
+                    'refresh_if_needed': False,
+                }
+            ),
         )
 
         await websocket.send_json(_notification('item/started', {'threadId': thread_id, 'turnId': turn_id, 'item': item}))
@@ -316,6 +320,7 @@ class CodexAppServerBridge:
             thread_id=thread_id,
             handoff=bool(state.compacted_flow),
             recent_raw_turns=len(state.history_items),
+            **compaction_payload_fields(after=handoff),
         )
 
         await websocket.send_json(_notification('item/completed', {'threadId': thread_id, 'turnId': turn_id, 'item': item}))

@@ -50,6 +50,7 @@ class Settings:
     compactor_merge_batch_size: int = int(os.getenv("COMPACTOR_MERGE_BATCH_SIZE", "8"))
     compaction_state_dir: str = os.getenv("COMPACTION_STATE_DIR", "state/compaction")
     enable_incremental_compaction: bool = _bool("ENABLE_INCREMENTAL_COMPACTION", False)
+    log_compaction_payloads: bool = _bool("LOG_COMPACTION_PAYLOADS", False)
     inline_compact_sentinel: str = os.getenv("INLINE_COMPACT_SENTINEL", "<<<LOCAL_COMPACT>>>")
     openai_passthrough_base_url: str = os.getenv("OPENAI_PASSTHROUGH_BASE_URL", "https://chatgpt.com/backend-api/codex")
     app_server_mode: str = os.getenv("APP_SERVER_MODE", "full")

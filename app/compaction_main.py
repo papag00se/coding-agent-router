@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import logging
-import json
 from typing import Any, Dict, Iterable
 from pathlib import Path
 
@@ -10,6 +8,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .app_server import CodexAppServerBridge
+from .compaction_transport import compaction_payload_fields, record_transport_event
 from .compat import (
     anthropic_request_from_responses,
     iter_responses_progress,
@@ -22,7 +21,6 @@ from .config import settings
 from .models import CompactRequest, InvokeRequest
 from .router import RoutingService
 
-logger = logging.getLogger(__name__)
 app = FastAPI(title="Local Agent Router Compaction Service", version="0.1.0")
 service = RoutingService()
 app_server = CodexAppServerBridge(service, mode="compaction_only")
@@ -31,11 +29,19 @@ _UPSTREAM = requests.Session()
 
 
 def _record_transport_event(event: str, **fields: Any) -> None:
-    payload = {'event': event, **fields}
-    _TRANSPORT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with _TRANSPORT_LOG_PATH.open('a', encoding='utf-8') as fh:
-        fh.write(json.dumps(payload, ensure_ascii=False) + '\n')
-    logger.warning('compaction_transport %s', json.dumps(payload, ensure_ascii=False))
+    record_transport_event(_TRANSPORT_LOG_PATH, event, **fields)
+
+
+def _log_inline_compaction_stream(events: Iterable[Dict[str, Any]], payload: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    for event in events:
+        if event.get('type') == 'final':
+            response = event.get('response')
+            _record_transport_event(
+                'inline_compaction_completed',
+                stream=True,
+                **compaction_payload_fields(after=response),
+            )
+        yield event
 
 
 def _unsupported_transport_response(transport: str) -> JSONResponse:
@@ -187,15 +193,34 @@ def invoke(req: InvokeRequest):
 
 @app.post("/internal/compact")
 def compact(req: CompactRequest):
-    return JSONResponse(
-        service.compact_session(
-            req.session_id,
-            req.items,
-            current_request=req.current_request,
-            repo_context=req.repo_context,
-            refresh_if_needed=req.refresh_if_needed,
-        )
+    _record_transport_event(
+        'internal_compact_start',
+        session_id=req.session_id,
+        refresh_if_needed=req.refresh_if_needed,
+        **compaction_payload_fields(
+            before={
+                'session_id': req.session_id,
+                'items': req.items,
+                'current_request': req.current_request,
+                'repo_context': req.repo_context,
+                'refresh_if_needed': req.refresh_if_needed,
+            }
+        ),
     )
+    handoff = service.compact_session(
+        req.session_id,
+        req.items,
+        current_request=req.current_request,
+        repo_context=req.repo_context,
+        refresh_if_needed=req.refresh_if_needed,
+    )
+    _record_transport_event(
+        'internal_compact_completed',
+        session_id=req.session_id,
+        refresh_if_needed=req.refresh_if_needed,
+        **compaction_payload_fields(after=handoff),
+    )
+    return JSONResponse(handoff)
 
 
 @app.post("/v1/messages")
@@ -212,14 +237,23 @@ def openai_chat_completions(_: Dict[str, Any]):
 async def openai_responses(request: Request):
     payload = await request.json()
     if _is_inline_compaction(payload):
-        _record_transport_event('inline_compaction_detected', stream=bool(payload.get('stream')))
+        _record_transport_event(
+            'inline_compaction_detected',
+            stream=bool(payload.get('stream')),
+            **compaction_payload_fields(before=payload),
+        )
         anthropic_req = anthropic_request_from_responses(payload)
         if payload.get('stream'):
             return StreamingResponse(
-                iter_responses_progress(service.stream_inline_compact_from_anthropic(anthropic_req), payload),
+                iter_responses_progress(_log_inline_compaction_stream(service.stream_inline_compact_from_anthropic(anthropic_req), payload), payload),
                 media_type='text/event-stream',
             )
         response = service.invoke_inline_compact_from_anthropic(anthropic_req)
+        _record_transport_event(
+            'inline_compaction_completed',
+            stream=False,
+            **compaction_payload_fields(after=response),
+        )
         return JSONResponse(responses_response(response, payload))
     return _proxy_response(request, '/responses', payload)
 

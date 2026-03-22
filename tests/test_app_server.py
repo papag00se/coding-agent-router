@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -144,7 +145,11 @@ class TestAppServerBridge(unittest.TestCase):
         service = DummyService()
         with tempfile.TemporaryDirectory() as tmpdir:
             bridge = CodexAppServerBridge(service, mode='compaction_only', state_dir=tmpdir)
-            with patch.object(main, 'app_server', bridge), patch('app.app_server._TRANSPORT_LOG_PATH', Path(tmpdir) / 'transport.jsonl'):
+            with (
+                patch.object(main, 'app_server', bridge),
+                patch('app.app_server._TRANSPORT_LOG_PATH', Path(tmpdir) / 'transport.jsonl'),
+                patch('app.compaction_transport.settings', SimpleNamespace(log_compaction_payloads=True)),
+            ):
                 client = TestClient(main.app)
                 with client.websocket_connect('/app-server/ws') as ws:
                     ws.send_json({'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'vscode', 'version': '1.0'}}})
@@ -168,6 +173,9 @@ class TestAppServerBridge(unittest.TestCase):
             events = [json.loads(line) for line in (Path(tmpdir) / 'transport.jsonl').read_text(encoding='utf-8').splitlines()]
             self.assertEqual(events[0]['event'], 'thread_compact_start')
             self.assertEqual(events[1]['event'], 'local_compaction_completed')
+            self.assertEqual(events[0]['before_payload']['session_id'], thread_id)
+            self.assertEqual(events[0]['before_payload']['current_request'], 'first request')
+            self.assertEqual(events[1]['after_payload']['stable_task_definition'], 'summary')
 
             reloaded = CodexAppServerBridge(service, mode='compaction_only', state_dir=tmpdir)
             state = reloaded._get_thread_state(thread_id)

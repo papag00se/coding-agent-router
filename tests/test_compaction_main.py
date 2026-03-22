@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
@@ -70,6 +73,32 @@ class TestCompactionMain(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['output_text'], 'compact summary')
         self.assertEqual(service.inline_requests[0]['system'], '<<<LOCAL_COMPACT>>> Summarize the thread.')
+
+    def test_responses_can_log_inline_compaction_payloads(self):
+        service = DummyInlineService()
+        events = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(compaction_main, 'service', service),
+                patch.object(compaction_main, '_TRANSPORT_LOG_PATH', Path(tmpdir) / 'transport.jsonl'),
+                patch('app.compaction_transport.settings', SimpleNamespace(log_compaction_payloads=True)),
+            ):
+                client = TestClient(compaction_main.app)
+                response = client.post(
+                    '/v1/responses',
+                    json={
+                        'model': 'gpt-5.4',
+                        'instructions': '<<<LOCAL_COMPACT>>> Summarize the thread.',
+                        'input': [{'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Current thread'}]}],
+                    },
+                )
+                events = [json.loads(line) for line in (Path(tmpdir) / 'transport.jsonl').read_text(encoding='utf-8').splitlines()]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(events[0]['event'], 'inline_compaction_detected')
+        self.assertEqual(events[0]['before_payload']['model'], 'gpt-5.4')
+        self.assertEqual(events[1]['event'], 'inline_compaction_completed')
+        self.assertEqual(events[1]['after_payload']['content'][0]['text'], 'compact summary')
 
     def test_responses_passthroughs_non_compaction_requests(self):
         service = DummyInlineService()

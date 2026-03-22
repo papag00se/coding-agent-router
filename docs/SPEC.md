@@ -551,6 +551,7 @@ Compaction companion passthrough behavior:
 - forwards to `OPENAI_PASSTHROUGH_BASE_URL + /responses`
 - streams bytes through unchanged when upstream streaming succeeds
 - logs transport metadata to `state/compaction_transport.jsonl`
+- can optionally include full before/after compaction payloads in that log when `LOG_COMPACTION_PAYLOADS=true`
 
 ## Discovery Endpoint Semantics
 
