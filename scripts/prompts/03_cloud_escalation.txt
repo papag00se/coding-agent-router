@@ -1,0 +1,10 @@
+I need a deep investigation plan for migrating a large polyrepo organization from mixed CI pipelines to a unified reusable workflow system.
+
+Requirements:
+- compare multiple rollout strategies
+- call out organizational risks
+- include how to inventory secrets, branch protections, and deployment coupling
+- include what should be validated before and after migration
+- assume there are hidden edge cases across many repositories
+
+Do not be brief.

@@ -1,0 +1,32 @@
+Review and minimally refactor this code.
+
+Tasks:
+1. infer intended behavior
+2. identify the top bugs or code smell
+3. preserve original intent
+4. return revised code and tests
+
+```python
+from typing import Dict
+
+def apply_updates(state: Dict[str, int], updates: Dict[str, int] | None = None) -> Dict[str, int]:
+    if updates is None:
+        updates = {}
+
+    result = dict(state)
+    for key, value in updates.items():
+        if value is None:
+            continue
+        if key in result:
+            result[key] = result.get(key, 0) + value
+        else:
+            result[key] = value
+
+    if "count" not in result:
+        result["count"] = 0
+
+    if result.get("count", 0) < 0:
+        result["count"] = 0
+
+    return result
+```

@@ -1,0 +1,7 @@
+You are acting as a strong coding agent.
+
+Tasks:
+1. read the repository you are in
+2. summarize likely architecture
+3. identify the smallest safe improvement you can make
+4. if you cannot safely modify files, explain why clearly

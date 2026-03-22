@@ -1,0 +1,58 @@
+# Local environment
+.env
+.env.*
+!.env.example
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Test and coverage artifacts
+.coverage
+.coverage.*
+coverage.json
+coverage.xml
+htmlcov/
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Type-checker and linter caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# Build and packaging artifacts
+build/
+dist/
+site/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Runtime state and logs
+state/
+*.log
+
+# Local archive artifacts
+local-agent-router-starter.zip
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

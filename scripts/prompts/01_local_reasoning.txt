@@ -1,0 +1,13 @@
+I need a design tradeoff analysis for a local-first AI coding setup.
+
+Constraints:
+- I have three GPUs with tight VRAM limits.
+- I want separate local coding and reasoning lanes.
+- I want to reduce cloud usage.
+- I accept some latency.
+- Do not write code.
+
+Deliver:
+1. 5 bullet points of likely intent
+2. 5 major tradeoffs
+3. the smallest viable rollout plan

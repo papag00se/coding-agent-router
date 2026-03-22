@@ -1,0 +1,32 @@
+[Unit]
+Description=Coding Agent Router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jesse
+Group=jesse
+WorkingDirectory=/home/jesse/src/coding-agent-router
+Environment=PATH=/home/jesse/.nvm/versions/node/v22.13.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+Environment=ROUTER_OLLAMA_BASE_URL=http://127.0.0.1:21435
+Environment=ROUTER_MODEL=qwen3:8b
+Environment=CODER_OLLAMA_BASE_URL=http://127.0.0.1:21435
+Environment=CODER_MODEL=devstral2:24b-iq4_xs
+Environment=REASONER_OLLAMA_BASE_URL=http://127.0.0.1:21435
+Environment=REASONER_MODEL=qwen3.5-9b:iq4_xs
+Environment=COMPACTOR_OLLAMA_BASE_URL=http://127.0.0.1:21435
+Environment=COMPACTOR_MODEL=qwen3.5-9b:iq4_xs
+Environment=ENABLE_CODEX_CLI=true
+Environment=CODEX_CMD=/home/jesse/.nvm/versions/node/v22.13.1/bin/codex
+Environment=CODEX_WORKDIR=/home/jesse/src/coding-agent-router
+Environment=APP_SERVER_STATE_DIR=/home/jesse/src/coding-agent-router/state/app_server_full
+ExecStart=/home/jesse/src/coding-agent-router/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
