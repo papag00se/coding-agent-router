@@ -12,13 +12,14 @@ class _FakeClient:
         self.content = content
         self.calls = []
 
-    def chat(self, model, messages, *, temperature, num_ctx, system=None, response_format=None, tools=None):
+    def chat(self, model, messages, *, temperature, num_ctx, max_tokens=None, system=None, response_format=None, tools=None):
         self.calls.append(
             {
                 "model": model,
                 "messages": messages,
                 "temperature": temperature,
                 "num_ctx": num_ctx,
+                "max_tokens": max_tokens,
                 "system": system,
                 "response_format": response_format,
                 "tools": tools,
@@ -44,6 +45,7 @@ class TestCompactionRefiner(unittest.TestCase):
         self.assertEqual(result.latest_plan, ["step 1"])
         self.assertEqual(result.merged_chunk_count, 4)
         self.assertEqual(client.calls[0]["response_format"], "json")
+        self.assertIsNotNone(client.calls[0]["max_tokens"])
 
     def test_refine_state_normalizes_structured_fields(self):
         client = _FakeClient(

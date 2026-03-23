@@ -422,6 +422,7 @@ class RoutingService:
                 settings.coder_model,
                 settings.coder_temperature,
                 settings.coder_num_ctx,
+                req.max_tokens,
                 transformed['system'] or load_prompt('coder_system.md'),
                 backend_messages or [{'role': 'user', 'content': transformed['prompt']}],
                 tools=backend_tools,
@@ -438,6 +439,7 @@ class RoutingService:
                 settings.reasoner_model,
                 settings.reasoner_temperature,
                 settings.reasoner_num_ctx,
+                req.max_tokens,
                 transformed['system'] or load_prompt('reasoner_system.md'),
                 backend_messages or [{'role': 'user', 'content': transformed['prompt']}],
                 tools=None,
@@ -456,6 +458,7 @@ class RoutingService:
         model: str,
         temperature: float,
         num_ctx: int,
+        max_tokens: int,
         system: str,
         messages: List[Dict[str, Any]],
         *,
@@ -474,6 +477,7 @@ class RoutingService:
             messages,
             temperature=temperature,
             num_ctx=num_ctx,
+            max_tokens=max_tokens,
             system=system,
             tools=tools,
         ):
@@ -568,6 +572,7 @@ class RoutingService:
                 messages,
                 temperature=settings.coder_temperature,
                 num_ctx=settings.coder_num_ctx,
+                max_tokens=max_tokens,
                 system=system or load_prompt('coder_system.md'),
                 tools=tools,
             )
@@ -581,6 +586,7 @@ class RoutingService:
                 messages,
                 temperature=settings.reasoner_temperature,
                 num_ctx=settings.reasoner_num_ctx,
+                max_tokens=max_tokens,
                 system=system or load_prompt('reasoner_system.md'),
             )
             return settings.reasoner_model, raw.get('message', {}).get('content', ''), raw.get('message', {}).get('thinking'), raw

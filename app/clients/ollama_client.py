@@ -34,18 +34,22 @@ class OllamaClient:
         *,
         temperature: float,
         num_ctx: int,
+        max_tokens: Optional[int] = None,
         system: Optional[str] = None,
         response_format: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        options: Dict[str, Any] = {
+            "temperature": temperature,
+            "num_ctx": num_ctx,
+        }
+        if max_tokens is not None:
+            options["num_predict"] = max_tokens
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": False,
-            "options": {
-                "temperature": temperature,
-                "num_ctx": num_ctx,
-            },
+            "options": options,
         }
         if system:
             payload["messages"] = [{"role": "system", "content": system}] + payload["messages"]
@@ -69,18 +73,22 @@ class OllamaClient:
         *,
         temperature: float,
         num_ctx: int,
+        max_tokens: Optional[int] = None,
         system: Optional[str] = None,
         response_format: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Iterator[Dict[str, Any]]:
+        options: Dict[str, Any] = {
+            "temperature": temperature,
+            "num_ctx": num_ctx,
+        }
+        if max_tokens is not None:
+            options["num_predict"] = max_tokens
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": True,
-            "options": {
-                "temperature": temperature,
-                "num_ctx": num_ctx,
-            },
+            "options": options,
         }
         if system:
             payload["messages"] = [{"role": "system", "content": system}] + payload["messages"]

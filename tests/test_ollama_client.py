@@ -54,6 +54,7 @@ class TestOllamaClient(unittest.TestCase):
             [{"role": "user", "content": "hi"}],
             temperature=0.2,
             num_ctx=4096,
+            max_tokens=256,
             system="sys",
             response_format="json",
             tools=[{"type": "function"}],
@@ -65,6 +66,7 @@ class TestOllamaClient(unittest.TestCase):
         self.assertEqual(payload["messages"][0], {"role": "system", "content": "sys"})
         self.assertEqual(payload["format"], "json")
         self.assertEqual(payload["tools"], [{"type": "function"}])
+        self.assertEqual(payload["options"]["num_predict"], 256)
         self.assertFalse(payload["stream"])
 
     def test_chat_without_optional_flags_keeps_minimal_payload(self) -> None:
@@ -111,6 +113,7 @@ class TestOllamaClient(unittest.TestCase):
                 [{"role": "user", "content": "hi"}],
                 temperature=0.2,
                 num_ctx=4096,
+                max_tokens=64,
                 system="sys",
                 response_format="json",
                 tools=[{"type": "function"}],
@@ -121,3 +124,4 @@ class TestOllamaClient(unittest.TestCase):
         self.assertEqual(payload["messages"][0], {"role": "system", "content": "sys"})
         self.assertEqual(payload["format"], "json")
         self.assertEqual(payload["tools"], [{"type": "function"}])
+        self.assertEqual(payload["options"]["num_predict"], 64)

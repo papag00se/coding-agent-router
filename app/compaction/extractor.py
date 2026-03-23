@@ -22,6 +22,7 @@ class CompactionExtractor:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         num_ctx: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> None:
         self.client = client or OllamaClient(
             settings.compactor_ollama_base_url,
@@ -32,6 +33,9 @@ class CompactionExtractor:
         self.model = model or settings.compactor_model
         self.temperature = settings.compactor_temperature if temperature is None else temperature
         self.num_ctx = settings.compactor_num_ctx if num_ctx is None else num_ctx
+        self.max_output_tokens = (
+            settings.compactor_response_headroom_tokens if max_output_tokens is None else max_output_tokens
+        )
 
     def extract_chunk(self, chunk: TranscriptChunk, repo_context: Optional[Dict[str, Any]] = None) -> ChunkExtraction:
         payload = build_extraction_payload(chunk, repo_context)
@@ -50,6 +54,7 @@ class CompactionExtractor:
             [{"role": "user", "content": payload}],
             temperature=self.temperature,
             num_ctx=self.num_ctx,
+            max_tokens=self.max_output_tokens,
             system=EXTRACTION_SYSTEM_PROMPT,
             response_format="json",
         )
