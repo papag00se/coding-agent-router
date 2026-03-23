@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..config import settings
 from ..task_metrics import estimate_tokens
-from .chunking import chunk_transcript_items, split_recent_raw_turns
+from .chunking import chunk_transcript_items_by_prompt, split_recent_raw_turns
 from .durable_memory import build_session_handoff, render_durable_memory
 from .extractor import CompactionExtractor
 from .handoff import build_codex_handoff_flow
 from .merger import merge_states
-from .models import CodexHandoffFlow, SessionHandoff
+from .normalize import normalize_transcript_for_compaction
+from .models import CodexHandoffFlow, MergedState, SessionHandoff
+from .prompts import estimate_extraction_request_tokens, estimate_refinement_request_tokens
+from .refiner import CompactionRefiner
 from .storage import CompactionStorage
 
 
@@ -17,9 +20,11 @@ class CompactionService:
     def __init__(
         self,
         extractor: Optional[CompactionExtractor] = None,
+        refiner: Optional[CompactionRefiner] = None,
         storage: Optional[CompactionStorage] = None,
     ) -> None:
         self.extractor = extractor or CompactionExtractor()
+        self.refiner = refiner or CompactionRefiner()
         self.storage = storage or CompactionStorage()
 
     def compact_transcript(
@@ -29,22 +34,69 @@ class CompactionService:
         *,
         current_request: str,
         repo_context: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
     ) -> SessionHandoff:
-        compactable, recent_raw_turns = split_recent_raw_turns(items, settings.compactor_keep_raw_tokens)
-        source_items = compactable or items
-        chunks = chunk_transcript_items(
-            source_items,
-            target_tokens=settings.compactor_target_chunk_tokens,
-            max_tokens=settings.compactor_max_chunk_tokens,
-            overlap_tokens=settings.compactor_overlap_tokens,
+        normalized = normalize_transcript_for_compaction(items, max_item_tokens=settings.compactor_max_chunk_tokens)
+        _emit_progress(
+            progress_callback,
+            'normalize_completed',
+            compactable_count=len(normalized.compactable_items),
+            preserved_tail_count=len(normalized.preserved_tail),
         )
-        extractions = [self.extractor.extract_chunk(chunk, repo_context) for chunk in chunks]
+        compactable, recent_raw_turns = split_recent_raw_turns(normalized.compactable_items, settings.compactor_keep_raw_tokens)
+        recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, normalized.preserved_tail)
+        max_prompt_tokens = max(1, settings.compactor_num_ctx - settings.compactor_response_headroom_tokens)
+        chunks, skipped_items = chunk_transcript_items_by_prompt(
+            compactable,
+            target_prompt_tokens=min(settings.compactor_target_chunk_tokens, max_prompt_tokens),
+            max_prompt_tokens=max_prompt_tokens,
+            overlap_tokens=settings.compactor_overlap_tokens,
+            prompt_token_counter=lambda chunk: estimate_extraction_request_tokens(chunk, repo_context),
+        )
+        _emit_progress(
+            progress_callback,
+            'chunking_completed',
+            chunk_count=len(chunks),
+            skipped_item_count=len(skipped_items),
+            max_prompt_tokens=max_prompt_tokens,
+        )
+        if skipped_items:
+            recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, skipped_items)
+        extractions = []
+        for index, chunk in enumerate(chunks, start=1):
+            _emit_progress(
+                progress_callback,
+                'extract_chunk_started',
+                chunk_id=chunk.chunk_id,
+                chunk_index=index,
+                chunk_count=len(chunks),
+                chunk_tokens=chunk.token_count,
+            )
+            extractions.append(self.extractor.extract_chunk(chunk, repo_context))
+            _emit_progress(
+                progress_callback,
+                'extract_chunk_completed',
+                chunk_id=chunk.chunk_id,
+                chunk_index=index,
+                chunk_count=len(chunks),
+            )
         merged = merge_states(extractions)
-        memory = render_durable_memory(merged, recent_raw_turns, current_request)
-        handoff = build_session_handoff(merged, recent_raw_turns, current_request)
+        _emit_progress(progress_callback, 'merge_completed', merged_chunk_count=merged.merged_chunk_count)
+        refined = self._refine_merged_state(
+            merged,
+            recent_raw_turns,
+            current_request=current_request,
+            repo_context=repo_context,
+            progress_callback=progress_callback,
+        )
+        final_recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, normalized.preserved_tail)
+        memory = render_durable_memory(refined, final_recent_raw_turns, current_request)
+        handoff = build_session_handoff(refined, final_recent_raw_turns, current_request)
+        _emit_progress(progress_callback, 'render_completed')
 
         self.storage.save_chunk_extractions(session_id, extractions)
         self.storage.save_merged_state(session_id, merged)
+        self.storage.save_refined_state(session_id, refined)
         self.storage.save_durable_memory(session_id, memory)
         self.storage.save_handoff(session_id, handoff)
         return handoff
@@ -66,9 +118,129 @@ class CompactionService:
         *,
         current_request: str,
         repo_context: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
     ) -> SessionHandoff:
         if estimate_tokens(items) < settings.compactor_target_chunk_tokens:
             existing = self.load_latest_handoff(session_id)
             if existing is not None:
                 return existing
-        return self.compact_transcript(session_id, items, current_request=current_request, repo_context=repo_context)
+        return self.compact_transcript(
+            session_id,
+            items,
+            current_request=current_request,
+            repo_context=repo_context,
+            progress_callback=progress_callback,
+        )
+
+    def _refine_merged_state(
+        self,
+        merged: MergedState,
+        recent_raw_turns: List[Dict[str, Any]],
+        *,
+        current_request: str,
+        repo_context: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
+    ) -> MergedState:
+        if not recent_raw_turns:
+            return merged
+
+        state = merged
+        remaining = list(recent_raw_turns)
+        iteration = 0
+        total_iterations = _estimate_refinement_iterations(remaining, merged, current_request=current_request, repo_context=repo_context)
+        while remaining:
+            max_recent_tokens = self._refinement_recent_token_budget(state, current_request=current_request, repo_context=repo_context)
+            if max_recent_tokens <= 0:
+                break
+            chunk_items, next_index = _take_items_with_token_budget(remaining, max_recent_tokens)
+            if not chunk_items:
+                break
+            iteration += 1
+            _emit_progress(
+                progress_callback,
+                'refine_iteration_started',
+                iteration=iteration,
+                iteration_count=total_iterations,
+                recent_turn_count=len(chunk_items),
+            )
+            state = self.refiner.refine_state(
+                state,
+                chunk_items,
+                current_request=current_request,
+                repo_context=repo_context,
+            )
+            remaining = remaining[next_index:]
+            _emit_progress(
+                progress_callback,
+                'refine_iteration_completed',
+                iteration=iteration,
+                iteration_count=total_iterations,
+            )
+        return state
+
+    def _refinement_recent_token_budget(
+        self,
+        state: MergedState,
+        *,
+        current_request: str,
+        repo_context: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        base_tokens = estimate_refinement_request_tokens(state, [], current_request, repo_context)
+        return max(0, settings.compactor_num_ctx - settings.compactor_response_headroom_tokens - base_tokens)
+
+
+def _merge_recent_raw_turns(existing: List[Dict[str, Any]], preserved_tail: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged = list(existing)
+    for item in preserved_tail:
+        if item not in merged:
+            merged.append(item)
+    return merged
+
+
+def _take_items_with_token_budget(items: List[Dict[str, Any]], max_tokens: int) -> tuple[List[Dict[str, Any]], int]:
+    token_total = 0
+    selected: List[Dict[str, Any]] = []
+    index = 0
+    while index < len(items):
+        item_tokens = estimate_tokens(items[index])
+        if selected and token_total + item_tokens > max_tokens:
+            break
+        if not selected and item_tokens > max_tokens:
+            selected.append(items[index])
+            index += 1
+            break
+        token_total += item_tokens
+        selected.append(items[index])
+        index += 1
+    return selected, index
+
+
+def _emit_progress(
+    progress_callback: Optional[Callable[..., None]],
+    stage: str,
+    **fields: Any,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(stage, **fields)
+
+
+def _estimate_refinement_iterations(
+    items: List[Dict[str, Any]],
+    state: MergedState,
+    *,
+    current_request: str,
+    repo_context: Optional[Dict[str, Any]] = None,
+) -> int:
+    remaining = list(items)
+    iterations = 0
+    while remaining:
+        base_tokens = estimate_refinement_request_tokens(state, [], current_request, repo_context)
+        max_recent_tokens = max(0, settings.compactor_num_ctx - settings.compactor_response_headroom_tokens - base_tokens)
+        if max_recent_tokens <= 0:
+            break
+        chunk_items, next_index = _take_items_with_token_budget(remaining, max_recent_tokens)
+        if not chunk_items:
+            break
+        iterations += 1
+        remaining = remaining[next_index:]
+    return iterations

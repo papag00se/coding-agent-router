@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.compaction.models import ChunkExtraction
 from app.compaction.service import CompactionService
@@ -41,18 +43,37 @@ class _FakeExtractor:
         )
 
 
+class _FakeRefiner:
+    def refine_state(self, state, recent_raw_turns, *, current_request, repo_context=None):
+        if recent_raw_turns and not state.latest_plan:
+            state.latest_plan = [current_request]
+        return state
+
+
 class TestHandoffFlow(unittest.TestCase):
     def test_service_builds_ordered_codex_handoff_flow_from_fixture(self):
         items = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
         extractor = _FakeExtractor()
+        refiner = _FakeRefiner()
         with tempfile.TemporaryDirectory() as tmpdir:
-            service = CompactionService(extractor=extractor, storage=CompactionStorage(Path(tmpdir)))
-            service.compact_transcript(
-                "fixture-session",
-                items,
-                current_request="Finish the remaining rename and rerun the search.",
-                repo_context={"repo": "coding-agent-router"},
-            )
+            service = CompactionService(extractor=extractor, refiner=refiner, storage=CompactionStorage(Path(tmpdir)))
+            with patch(
+                "app.compaction.service.settings",
+                SimpleNamespace(
+                    compactor_keep_raw_tokens=100,
+                    compactor_target_chunk_tokens=6000,
+                    compactor_max_chunk_tokens=8000,
+                    compactor_overlap_tokens=500,
+                    compactor_num_ctx=12000,
+                    compactor_response_headroom_tokens=1024,
+                ),
+            ):
+                service.compact_transcript(
+                    "fixture-session",
+                    items,
+                    current_request="Finish the remaining rename and rerun the search.",
+                    repo_context={"repo": "coding-agent-router"},
+                )
 
             flow = service.build_codex_handoff_flow("fixture-session")
 

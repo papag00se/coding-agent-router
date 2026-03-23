@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .app_server import CodexAppServerBridge
+from .compaction.normalize import sanitize_inline_compaction_payload
 from .compaction_transport import compaction_payload_fields, record_transport_event
 from .compat import (
     anthropic_request_from_responses,
@@ -18,12 +19,14 @@ from .compat import (
     responses_response,
 )
 from .config import settings
+from .inline_compaction_jobs import InlineCompactionJobManager, inline_compaction_request_key
 from .models import CompactRequest, InvokeRequest
 from .router import RoutingService
 
 app = FastAPI(title="Local Agent Router Compaction Service", version="0.1.0")
 service = RoutingService()
 app_server = CodexAppServerBridge(service, mode="compaction_only")
+inline_compaction_jobs = InlineCompactionJobManager(service)
 _TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
 _UPSTREAM = requests.Session()
 
@@ -40,6 +43,12 @@ def _log_inline_compaction_stream(events: Iterable[Dict[str, Any]], payload: Dic
                 'inline_compaction_completed',
                 stream=True,
                 **compaction_payload_fields(after=response),
+            )
+        if event.get('type') == 'failed':
+            _record_transport_event(
+                'inline_compaction_failed',
+                stream=True,
+                error=str(event.get('message') or 'inline compaction failed'),
             )
         yield event
 
@@ -237,20 +246,39 @@ def openai_chat_completions(_: Dict[str, Any]):
 async def openai_responses(request: Request):
     payload = await request.json()
     if _is_inline_compaction(payload):
+        sanitized_payload = sanitize_inline_compaction_payload(payload)
+        job_key = inline_compaction_request_key(sanitized_payload)
         _record_transport_event(
             'inline_compaction_detected',
+            request_key=job_key,
             stream=bool(payload.get('stream')),
             **compaction_payload_fields(before=payload),
         )
-        anthropic_req = anthropic_request_from_responses(payload)
+        anthropic_req = anthropic_request_from_responses(sanitized_payload)
+        job, created = inline_compaction_jobs.get_or_create(sanitized_payload, anthropic_req)
+        _record_transport_event(
+            'inline_compaction_job_started' if created else 'inline_compaction_job_reused',
+            request_key=job.key,
+            stream=bool(payload.get('stream')),
+        )
         if payload.get('stream'):
             return StreamingResponse(
-                iter_responses_progress(_log_inline_compaction_stream(service.stream_inline_compact_from_anthropic(anthropic_req), payload), payload),
+                iter_responses_progress(_log_inline_compaction_stream(job.iter_events(), payload), payload),
                 media_type='text/event-stream',
             )
-        response = service.invoke_inline_compact_from_anthropic(anthropic_req)
+        try:
+            response = job.wait()
+        except RuntimeError as exc:
+            _record_transport_event(
+                'inline_compaction_failed',
+                request_key=job.key,
+                stream=False,
+                error=str(exc),
+            )
+            return JSONResponse({'error': str(exc)}, status_code=500)
         _record_transport_event(
             'inline_compaction_completed',
+            request_key=job.key,
             stream=False,
             **compaction_payload_fields(after=response),
         )

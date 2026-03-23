@@ -11,10 +11,10 @@ from typing import Any, Dict, List, Optional
 from fastapi import WebSocket
 from starlette.concurrency import run_in_threadpool
 
+from .compaction import render_compacted_flow
 from .compaction_transport import compaction_payload_fields, record_transport_event
 from .config import settings
 from .models import AnthropicMessagesRequest
-from .prompt_loader import render_prompt
 
 _TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
 
@@ -71,18 +71,7 @@ def _response_text(response: Dict[str, Any]) -> str:
 
 
 def _render_compacted_flow(flow: Dict[str, Any], *, current_request: str) -> str:
-    durable_memory_blocks = '\n\n'.join(
-        f"### {item['name']}\n{item['content'].rstrip()}" for item in flow.get('durable_memory') or []
-    )
-    return render_prompt(
-        'app_server_compacted_flow.md',
-        {
-            'DURABLE_MEMORY_BLOCKS': durable_memory_blocks,
-            'STRUCTURED_HANDOFF': json.dumps(flow.get('structured_handoff') or {}, ensure_ascii=False, indent=2),
-            'RECENT_RAW_TURNS': json.dumps(flow.get('recent_raw_turns') or [], ensure_ascii=False, indent=2),
-            'CURRENT_REQUEST': current_request or flow.get('current_request') or '',
-        },
-    )
+    return render_compacted_flow(flow, current_request=current_request)
 
 
 @dataclass

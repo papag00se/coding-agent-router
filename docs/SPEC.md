@@ -466,11 +466,21 @@ For `thread/compact/start`:
 
 Implemented in [`app/compaction/chunking.py`](/home/jesse/src/coding-agent-router/app/compaction/chunking.py).
 
+Pre-processing behavior:
+
+- normalizes transcript items before chunking
+- strips `encrypted_content` recursively from compactable history
+- removes attachment-like content blocks from compactable history
+- drops oversize compactable content nodes by rough token estimate
+- preserves the newest top-level turn raw for later reattachment
+- strips the known Codex bootstrap `instructions` block on inline compaction requests
+
 Behavior:
 
 - estimates tokens heuristically with `len(text) / 4`
-- retains newest turns as raw tail based on `COMPACTOR_KEEP_RAW_TOKENS`
+- retains recent compactable turns as raw tail based on `COMPACTOR_KEEP_RAW_TOKENS`
 - chunks older transcript items by target token budget
+- chunks at transcript item boundaries rather than slicing message content
 - carries overlap forward into the next chunk
 
 ### Extraction
@@ -496,8 +506,24 @@ Behavior:
 
 - latest non-empty scalar wins
 - repo state dictionaries are shallow-merged with later values overwriting earlier values
-- list fields are deduplicated case-insensitively while preserving first occurrence order
+- list fields are deduplicated case-insensitively while prioritizing newer entries
 - latest non-empty plan list wins
+
+### Refinement
+
+Implemented in [`app/compaction/refiner.py`](/home/jesse/src/coding-agent-router/app/compaction/refiner.py).
+
+Behavior:
+
+- takes deterministic merged state as the source of truth
+- refines it with chunked `recent_raw_turns` in Ollama JSON mode
+- uses recent raw turns only to reprioritize, dedupe, clarify, or add explicitly visible facts
+- does not include the preserved newest raw turn in refinement input
+- reattaches the preserved newest raw turn after refinement
+
+Prompt source:
+
+- [`compaction_refinement_system.md`](/home/jesse/src/coding-agent-router/app/prompts/compaction_refinement_system.md)
 
 ### Durable Memory Rendering
 
@@ -534,6 +560,7 @@ Per-session structure:
 
 - `<session>/chunks/chunk-<n>.json`
 - `<session>/merged-state.json`
+- `<session>/refined-state.json`
 - `<session>/handoff.json`
 - `<session>/TASK_STATE.md`
 - `<session>/DECISIONS.md`

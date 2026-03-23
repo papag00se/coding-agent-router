@@ -23,6 +23,11 @@ class CompactionStorage:
         directory.mkdir(parents=True, exist_ok=True)
         self._write_json(directory / "merged-state.json", state.model_dump())
 
+    def save_refined_state(self, session_id: str, state: MergedState) -> None:
+        directory = self._session_dir(session_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        self._write_json(directory / "refined-state.json", state.model_dump())
+
     def save_durable_memory(self, session_id: str, memory: DurableMemorySet) -> None:
         directory = self._session_dir(session_id)
         directory.mkdir(parents=True, exist_ok=True)

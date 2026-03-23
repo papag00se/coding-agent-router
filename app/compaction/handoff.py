@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any, Dict
 
 from ..prompt_loader import render_prompt
 from .models import CodexHandoffFlow, DurableMemorySet, SessionHandoff
@@ -18,6 +19,25 @@ def build_codex_handoff_flow(memory: DurableMemorySet, handoff: SessionHandoff, 
         structured_handoff=handoff.model_dump(),
         recent_raw_turns=handoff.recent_raw_turns,
         current_request=current_request if current_request is not None else handoff.current_request,
+    )
+
+
+def render_compacted_flow(flow: CodexHandoffFlow | Dict[str, Any], *, current_request: str = "") -> str:
+    if isinstance(flow, CodexHandoffFlow):
+        payload = flow.model_dump()
+    else:
+        payload = flow
+    durable_memory_blocks = "\n\n".join(
+        f"### {item['name']}\n{item['content'].rstrip()}" for item in payload.get("durable_memory") or []
+    )
+    return render_prompt(
+        "app_server_compacted_flow.md",
+        {
+            "DURABLE_MEMORY_BLOCKS": durable_memory_blocks,
+            "STRUCTURED_HANDOFF": json.dumps(payload.get("structured_handoff") or {}, ensure_ascii=False, indent=2),
+            "RECENT_RAW_TURNS": json.dumps(payload.get("recent_raw_turns") or [], ensure_ascii=False, indent=2),
+            "CURRENT_REQUEST": current_request or payload.get("current_request") or "",
+        },
     )
 
 

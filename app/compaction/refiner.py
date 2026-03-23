@@ -3,18 +3,18 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..clients.ollama_client import OllamaClient
 from ..config import settings
-from .models import ChunkExtraction, TranscriptChunk
-from .prompts import EXTRACTION_SYSTEM_PROMPT, build_extraction_payload, estimate_extraction_request_tokens
-from .structured_output import normalize_chunk_extraction_payload
+from .models import MergedState
+from .prompts import REFINEMENT_SYSTEM_PROMPT, build_refinement_payload, estimate_refinement_request_tokens
+from .structured_output import normalize_merged_state_payload
 
 logger = logging.getLogger(__name__)
 
 
-class CompactionExtractor:
+class CompactionRefiner:
     def __init__(
         self,
         client: Optional[OllamaClient] = None,
@@ -33,16 +33,24 @@ class CompactionExtractor:
         self.temperature = settings.compactor_temperature if temperature is None else temperature
         self.num_ctx = settings.compactor_num_ctx if num_ctx is None else num_ctx
 
-    def extract_chunk(self, chunk: TranscriptChunk, repo_context: Optional[Dict[str, Any]] = None) -> ChunkExtraction:
-        payload = build_extraction_payload(chunk, repo_context)
-        prompt_tokens = estimate_extraction_request_tokens(chunk, repo_context)
+    def refine_state(
+        self,
+        state: MergedState,
+        recent_raw_turns: List[Dict[str, Any]],
+        *,
+        current_request: str,
+        repo_context: Optional[Dict[str, Any]] = None,
+    ) -> MergedState:
+        if not recent_raw_turns:
+            return state
+        payload = build_refinement_payload(state, recent_raw_turns, current_request, repo_context)
+        prompt_tokens = estimate_refinement_request_tokens(state, recent_raw_turns, current_request, repo_context)
         logger.warning(
-            "compaction_llm_request stage=extract chunk_id=%s model=%s prompt_tokens=%s chunk_tokens=%s item_count=%s",
-            chunk.chunk_id,
+            "compaction_llm_request stage=refine model=%s prompt_tokens=%s recent_turn_count=%s merged_chunk_count=%s",
             self.model,
             prompt_tokens,
-            chunk.token_count,
-            len(chunk.items),
+            len(recent_raw_turns),
+            state.merged_chunk_count,
         )
         started_at = time.monotonic()
         raw = self.client.chat(
@@ -50,13 +58,12 @@ class CompactionExtractor:
             [{"role": "user", "content": payload}],
             temperature=self.temperature,
             num_ctx=self.num_ctx,
-            system=EXTRACTION_SYSTEM_PROMPT,
+            system=REFINEMENT_SYSTEM_PROMPT,
             response_format="json",
         )
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         logger.warning(
-            "compaction_llm_response stage=extract chunk_id=%s model=%s elapsed_ms=%s prompt_eval_count=%s eval_count=%s",
-            chunk.chunk_id,
+            "compaction_llm_response stage=refine model=%s elapsed_ms=%s prompt_eval_count=%s eval_count=%s",
             self.model,
             elapsed_ms,
             raw.get("prompt_eval_count"),
@@ -67,10 +74,9 @@ class CompactionExtractor:
             parsed = json.loads(content) if isinstance(content, str) else content
         except json.JSONDecodeError as exc:
             preview = content[:500] if isinstance(content, str) else repr(content)
-            raise ValueError(f"compaction extractor returned non-JSON output: {preview}") from exc
+            raise ValueError(f"compaction refiner returned non-JSON output: {preview}") from exc
         if not isinstance(parsed, dict):
-            raise ValueError(f"compaction extractor returned non-object output: {type(parsed).__name__}")
-        parsed = normalize_chunk_extraction_payload(parsed)
-        parsed.setdefault("chunk_id", chunk.chunk_id)
-        parsed.setdefault("source_token_count", chunk.token_count)
-        return ChunkExtraction.model_validate(parsed)
+            raise ValueError(f"compaction refiner returned non-object output: {type(parsed).__name__}")
+        parsed = normalize_merged_state_payload(parsed)
+        parsed.setdefault("merged_chunk_count", state.merged_chunk_count)
+        return MergedState.model_validate(parsed)

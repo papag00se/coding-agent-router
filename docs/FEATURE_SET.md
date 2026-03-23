@@ -146,10 +146,16 @@ The repository includes a dedicated compaction subsystem under [`app/compaction/
 
 Implemented flow:
 
-- split a transcript into compactable history and recent raw turns
-- chunk large histories with overlap
+- pre-clean structured transcript items before compaction
+- strip `encrypted_content` and attachment-like blocks from compactable history
+- strip the known Codex bootstrap `instructions` block for inline compaction requests
+- preserve the newest top-level turn raw and exclude it from compaction
+- split the remaining transcript into compactable history and recent raw turns
+- chunk large histories with overlap at item boundaries
 - extract chunk-local durable state with a compactor model in JSON mode
-- merge chunk extractions into a session-level state
+- merge chunk extractions into a session-level state deterministically
+- run a constrained final refinement pass over the merged state plus chunked recent raw turns
+- reattach the preserved newest raw turn after refinement
 - render five durable memory documents
 - persist JSON and Markdown artifacts to disk
 - build a Codex-ready handoff flow with memory, structured handoff, recent raw turns, and current request
@@ -161,6 +167,12 @@ Persisted durable memory files:
 - `FAILURES_TO_AVOID.md`
 - `NEXT_STEPS.md`
 - `SESSION_HANDOFF.md`
+
+Additional persisted JSON artifacts:
+
+- `merged-state.json`
+- `refined-state.json`
+- `handoff.json`
 
 ### Prompt File Architecture
 
@@ -202,6 +214,7 @@ Implemented rules:
 - checks `instructions`
 - checks only the current user turn in Responses input
 - ignores sentinel text that appears only in historical tool output
+- removes the known `You are Codex...` bootstrap instructions block before inline compaction conversion
 
 ### Persistence and Observability
 

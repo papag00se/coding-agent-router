@@ -131,8 +131,19 @@ class TestRouterHelpers(unittest.TestCase):
 
     def test_compaction_wrappers_and_inline_compaction_paths(self) -> None:
         class DummyCompactionService:
+            def __init__(self):
+                self.compact_calls = []
+
             def compact_transcript(self, *args, **kwargs):
-                return SessionHandoff(stable_task_definition="compact")
+                self.compact_calls.append((args, kwargs))
+                items = args[1] if len(args) > 1 else kwargs["items"]
+                return SessionHandoff(
+                    stable_task_definition="fix hydration mismatch",
+                    key_decisions=["prefer the shared compacted flow renderer"],
+                    unresolved_work=["rerun the browser test"],
+                    current_request=kwargs["current_request"],
+                    recent_raw_turns=items[-1:],
+                )
 
             def refresh_if_needed(self, *args, **kwargs):
                 return SessionHandoff(stable_task_definition="refresh")
@@ -143,21 +154,20 @@ class TestRouterHelpers(unittest.TestCase):
                 return None
 
             def build_codex_handoff_flow(self, session_id, *, current_request=None):
-                if session_id == "found":
-                    return CodexHandoffFlow(current_request=current_request or "")
+                if session_id in {"found", "thread-1"}:
+                    return CodexHandoffFlow(
+                        durable_memory=[
+                            {"name": "TASK_STATE.md", "content": "# Task State\n- fix hydration mismatch\n"},
+                            {"name": "NEXT_STEPS.md", "content": "# Next Steps\n- rerun the browser test\n"},
+                        ],
+                        structured_handoff={"stable_task_definition": "fix hydration mismatch"},
+                        recent_raw_turns=[{"role": "assistant", "content": "Investigated header rendering."}],
+                        current_request=current_request or "",
+                    )
                 return None
-
-        class DummyCompactorClient:
-            def chat(self, *args, **kwargs):
-                return {"message": {"content": "summary"}, "prompt_eval_count": 5, "eval_count": 2}
-
-            def chat_stream(self, *args, **kwargs):
-                yield {"message": {"content": "sum"}, "prompt_eval_count": 5}
-                yield {"message": {"content": "mary"}, "eval_count": 2}
 
         service = router.RoutingService.__new__(router.RoutingService)
         service.compaction_service = DummyCompactionService()
-        service.compactor_client = DummyCompactorClient()
 
         with patch.object(router, "settings", create=True) as mock_settings:
             mock_settings.compactor_model = "compact-model"
@@ -167,7 +177,7 @@ class TestRouterHelpers(unittest.TestCase):
 
             compacted = service.compact_session("s1", [{"role": "user", "content": "hi"}], current_request="do it")
             refreshed = service.compact_session("s1", [{"role": "user", "content": "hi"}], current_request="do it", refresh_if_needed=True)
-            self.assertEqual(compacted["stable_task_definition"], "compact")
+            self.assertEqual(compacted["stable_task_definition"], "fix hydration mismatch")
             self.assertEqual(refreshed["stable_task_definition"], "refresh")
             self.assertEqual(service.load_compaction_handoff("missing"), None)
             self.assertEqual(service.load_compaction_handoff("found")["stable_task_definition"], "loaded")
@@ -177,17 +187,62 @@ class TestRouterHelpers(unittest.TestCase):
             req = models.AnthropicMessagesRequest.model_validate(
                 {
                     "system": "<<<LOCAL_COMPACT>>> compact this",
-                    "messages": [{"role": "user", "content": "<<<LOCAL_COMPACT>>> payload"}],
-                    "metadata": {"source": "test"},
+                    "messages": [
+                        {"role": "assistant", "content": "Investigated header rendering."},
+                        {"role": "user", "content": "Fix the hydration mismatch in the header."},
+                        {"role": "user", "content": "<<<LOCAL_COMPACT>>> Summarize the thread for continuation."},
+                    ],
+                    "metadata": {"source": "test", "session_id": "thread-1", "cwd": "/tmp/project"},
                 }
             )
             inline = service.invoke_inline_compact_from_anthropic(req)
-            self.assertEqual(inline["content"][0]["text"], "summary")
-            self.assertEqual(inline["usage"]["input_tokens"], 5)
+            self.assertIn("TASK_STATE.md", inline["content"][0]["text"])
+            self.assertIn("Fix the hydration mismatch in the header.", inline["content"][0]["text"])
+            self.assertNotIn("Summarize the thread for continuation.", inline["content"][0]["text"])
+            self.assertEqual(inline["raw_backend"]["current_request"], "Fix the hydration mismatch in the header.")
+            self.assertGreater(inline["usage"]["input_tokens"], 0)
+            self.assertEqual(service.compaction_service.compact_calls[-1][0][0], "thread-1")
+            self.assertEqual(
+                service.compaction_service.compact_calls[-1][0][1],
+                [
+                    {"role": "assistant", "content": "Investigated header rendering."},
+                    {"role": "user", "content": "Fix the hydration mismatch in the header."},
+                ],
+            )
 
             streamed = list(service.stream_inline_compact_from_anthropic(req))
-            self.assertEqual([event["type"] for event in streamed], ["text_delta", "text_delta", "final"])
-            self.assertEqual(streamed[-1]["response"]["content"][0]["text"], "summary")
+            self.assertEqual([event["type"] for event in streamed], ["text_delta", "final"])
+            self.assertIn("TASK_STATE.md", streamed[-1]["response"]["content"][0]["text"])
+
+    def test_inline_compaction_inputs_preserve_structured_tool_output_turns(self) -> None:
+        with patch.object(router, "settings", create=True) as mock_settings:
+            mock_settings.inline_compact_sentinel = "<<<LOCAL_COMPACT>>>"
+            req = models.AnthropicMessagesRequest.model_validate(
+                {
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "Inspect the failing tool output."}]},
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "tool_use", "id": "call_1", "name": "run_shell", "input": {"cmd": "pwd"}}],
+                        },
+                        {
+                            "role": "user",
+                            "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "stdout"}],
+                        },
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "<<<LOCAL_COMPACT>>> Summarize the thread."}],
+                        },
+                    ]
+                }
+            )
+
+            items, current_request = router._inline_compaction_inputs(req)
+
+        self.assertEqual(current_request, "Inspect the failing tool output.")
+        self.assertEqual(items[1]["content"][0]["type"], "tool_use")
+        self.assertEqual(items[2]["content"][0]["type"], "tool_result")
+        self.assertNotIn("Summarize the thread.", str(items))
 
     def test_stream_from_anthropic_covers_reasoner_and_codex_routes(self) -> None:
         class DummyReasonerClient:
@@ -318,12 +373,19 @@ class TestRouterHelpers(unittest.TestCase):
         service.compaction_service = type("Compaction", (), {"build_codex_handoff_flow": lambda *_args, **_kwargs: None})()
         self.assertEqual(service._build_codex_cli_prompt("sys", "prompt", {"session_id": "s1"}), "sys\n\nprompt")
 
-        class SilentCompactor:
-            def chat_stream(self, *args, **kwargs):
-                yield {"message": {"content": ""}, "prompt_eval_count": 1}
-                yield {"message": {"content": "done"}, "eval_count": 1}
+        class InlineCompactionService:
+            def compact_transcript(self, session_id, items, *, current_request, repo_context=None, progress_callback=None):
+                return SessionHandoff(current_request=current_request, recent_raw_turns=items[-1:])
 
-        service.compactor_client = SilentCompactor()
+            def build_codex_handoff_flow(self, session_id, *, current_request=None):
+                return CodexHandoffFlow(
+                    durable_memory=[{"name": "TASK_STATE.md", "content": "# Task State\n- done\n"}],
+                    structured_handoff={},
+                    recent_raw_turns=[],
+                    current_request=current_request or "",
+                )
+
+        service.compaction_service = InlineCompactionService()
         with patch.object(router, "settings", create=True) as mock_settings:
             mock_settings.compactor_model = "compact-model"
             mock_settings.compactor_temperature = 0.0

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 from ..task_metrics import estimate_tokens
 from .models import TranscriptChunk
@@ -55,6 +55,73 @@ def chunk_transcript_items(
     return chunks
 
 
+def chunk_transcript_items_by_prompt(
+    items: List[Dict[str, Any]],
+    *,
+    target_prompt_tokens: int,
+    max_prompt_tokens: int,
+    overlap_tokens: int,
+    prompt_token_counter: Callable[[TranscriptChunk], int],
+) -> tuple[List[TranscriptChunk], List[Dict[str, Any]]]:
+    if not items:
+        return [], []
+
+    token_counts = [estimate_tokens(item) for item in items]
+    chunks: List[TranscriptChunk] = []
+    skipped_items: List[Dict[str, Any]] = []
+    start = 0
+    chunk_id = 1
+
+    while start < len(items):
+        end = start
+        token_total = 0
+        best_end = start
+        best_token_total = 0
+
+        while end < len(items):
+            token_total += token_counts[end]
+            candidate_chunk = TranscriptChunk(
+                chunk_id=chunk_id,
+                start_index=start,
+                end_index=end + 1,
+                token_count=token_total,
+                overlap_from_previous_tokens=0 if start == 0 else _overlap_size(token_counts, start, end + 1),
+                items=items[start : end + 1],
+            )
+            prompt_tokens = prompt_token_counter(candidate_chunk)
+            if prompt_tokens > max_prompt_tokens:
+                break
+            best_end = end + 1
+            best_token_total = token_total
+            if prompt_tokens >= target_prompt_tokens:
+                break
+            end += 1
+
+        if best_end == start:
+            skipped_items.append(items[start])
+            start += 1
+            continue
+
+        overlap_used = 0 if start == 0 else _overlap_size(token_counts, start, best_end)
+        chunks.append(
+            TranscriptChunk(
+                chunk_id=chunk_id,
+                start_index=start,
+                end_index=best_end,
+                token_count=best_token_total,
+                overlap_from_previous_tokens=overlap_used,
+                items=items[start:best_end],
+            )
+        )
+        chunk_id += 1
+        if best_end >= len(items):
+            break
+        next_start = _next_start(token_counts, start, best_end, overlap_tokens)
+        start = next_start if next_start > start else best_end
+
+    return chunks, skipped_items
+
+
 def split_recent_raw_turns(items: List[Dict[str, Any]], keep_tokens: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if keep_tokens <= 0 or not items:
         return items, []
@@ -82,4 +149,3 @@ def _overlap_size(token_counts: List[int], start: int, end: int) -> int:
     if start >= end:
         return 0
     return sum(token_counts[start:end])
-

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import time
+from queue import Empty, Queue
 from pathlib import Path
+from threading import Thread
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -13,6 +15,7 @@ from .tool_surface import map_stream_tool_call_to_original, map_tool_call_to_ori
 ROUTER_MODEL_ID = 'router'
 CODEX_MODEL_ID = 'gpt-5.4'
 _CODEX_MODELS_CACHE_PATH = Path.home() / '.codex' / 'models_cache.json'
+_SSE_KEEPALIVE_INTERVAL_SECONDS = 2.0
 
 
 def _text_blocks(content: Any) -> List[Dict[str, Any]]:
@@ -445,6 +448,10 @@ def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
     return f'event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n'
 
 
+def _sse_comment(comment: str) -> str:
+    return f': {comment}\n\n'
+
+
 def iter_responses_response(response: Dict[str, Any], request: Optional[Dict[str, Any]] = None) -> Iterator[str]:
     completed = responses_response(response, request)
     in_progress = dict(completed)
@@ -533,7 +540,59 @@ def iter_responses_progress(events: Iterable[Dict[str, Any]], request: Optional[
     next_output_index = 1
     emitted_tool_call_ids: set[str] = set()
     _, aliases = translate_responses_tools((request or {}).get('tools'))
-    for event in events:
+    event_queue: Queue[tuple[str, Any]] = Queue()
+
+    def _produce_events() -> None:
+        try:
+            for event in events:
+                event_queue.put(('event', event))
+        except BaseException as exc:
+            event_queue.put(('error', exc))
+        finally:
+            event_queue.put(('done', None))
+
+    producer = Thread(target=_produce_events, daemon=True)
+    producer.start()
+
+    while True:
+        try:
+            queue_item_type, queue_item = event_queue.get(timeout=_SSE_KEEPALIVE_INTERVAL_SECONDS)
+        except Empty:
+            yield _sse_comment('keepalive')
+            continue
+
+        if queue_item_type == 'done':
+            return
+        if queue_item_type == 'error':
+            raise queue_item
+
+        event = queue_item
+        if event.get('type') == 'progress':
+            progress_response = dict(shell)
+            metadata = dict(progress_response.get('metadata') or {})
+            progress_payload = {
+                'stage': event.get('stage'),
+                'message': event.get('message'),
+                'heartbeat': bool(event.get('heartbeat')),
+            }
+            for key in ('timestamp', 'elapsed_seconds', 'chunk_id', 'chunk_index', 'chunk_count', 'iteration', 'iteration_count'):
+                if key in event:
+                    progress_payload[key] = event.get(key)
+            metadata['_compaction_progress'] = progress_payload
+            progress_response['metadata'] = metadata
+            yield _sse_event('response.in_progress', {'type': 'response.in_progress', 'response': progress_response})
+            continue
+
+        if event.get('type') == 'failed':
+            failed = dict(shell)
+            failed['status'] = 'failed'
+            failed['error'] = {
+                'message': str(event.get('message') or 'request failed'),
+                'type': 'server_error',
+            }
+            yield _sse_event('response.failed', {'type': 'response.failed', 'response': failed})
+            return
+
         if event.get('type') == 'final':
             completed = responses_response(event['response'], request)
             banner = _route_banner(event['response'])

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.compaction.chunking import chunk_transcript_items, split_recent_raw_turns
+from app.compaction.chunking import chunk_transcript_items, chunk_transcript_items_by_prompt, split_recent_raw_turns
 
 
 class TestCompactionChunking(unittest.TestCase):
@@ -53,3 +53,46 @@ class TestCompactionChunking(unittest.TestCase):
         compactable, recent = split_recent_raw_turns(items, keep_tokens=0)
         self.assertEqual(compactable, items)
         self.assertEqual(recent, [])
+
+    def test_chunk_transcript_items_by_prompt_splits_on_prompt_budget(self):
+        items = [{"role": "user", "content": "x" * 2000} for _ in range(4)]
+
+        chunks, skipped = chunk_transcript_items_by_prompt(
+            items,
+            target_prompt_tokens=900,
+            max_prompt_tokens=1300,
+            overlap_tokens=0,
+            prompt_token_counter=lambda chunk: 300 + (len(chunk.items) * 500),
+        )
+
+        self.assertEqual(skipped, [])
+        self.assertEqual([len(chunk.items) for chunk in chunks], [2, 2])
+
+    def test_chunk_transcript_items_by_prompt_skips_oversize_single_item(self):
+        items = [
+            {"role": "user", "content": "small"},
+            {"role": "tool", "content": "huge"},
+            {"role": "assistant", "content": "small again"},
+        ]
+        prompt_tokens = {
+            "small": 700,
+            "huge": 2500,
+            "small again": 700,
+            "small|huge": 3200,
+            "huge|small again": 3200,
+        }
+
+        def counter(chunk):
+            key = "|".join(str(item["content"]) for item in chunk.items)
+            return prompt_tokens[key]
+
+        chunks, skipped = chunk_transcript_items_by_prompt(
+            items,
+            target_prompt_tokens=1000,
+            max_prompt_tokens=1500,
+            overlap_tokens=0,
+            prompt_token_counter=counter,
+        )
+
+        self.assertEqual([chunk.items for chunk in chunks], [[items[0]], [items[2]]])
+        self.assertEqual(skipped, [items[1]])

@@ -47,6 +47,7 @@ class Settings:
     compactor_max_chunk_tokens: int = int(os.getenv("COMPACTOR_MAX_CHUNK_TOKENS", "14000"))
     compactor_overlap_tokens: int = int(os.getenv("COMPACTOR_OVERLAP_TOKENS", "1500"))
     compactor_keep_raw_tokens: int = int(os.getenv("COMPACTOR_KEEP_RAW_TOKENS", "8000"))
+    compactor_response_headroom_tokens: int = int(os.getenv("COMPACTOR_RESPONSE_HEADROOM_TOKENS", "2048"))
     compactor_merge_batch_size: int = int(os.getenv("COMPACTOR_MERGE_BATCH_SIZE", "8"))
     compaction_state_dir: str = os.getenv("COMPACTION_STATE_DIR", "state/compaction")
     enable_incremental_compaction: bool = _bool("ENABLE_INCREMENTAL_COMPACTION", False)

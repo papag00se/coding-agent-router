@@ -59,7 +59,8 @@ def _merge_repo_state(values: Iterable[dict]) -> dict:
 def _merge_unique(groups: Iterable[Iterable[str]]) -> List[str]:
     seen: set[str] = set()
     merged: List[str] = []
-    for group in groups:
+    items = list(groups)
+    for group in reversed(items):
         for item in group or []:
             key = item.strip().lower()
             if not key or key in seen:

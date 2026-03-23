@@ -85,9 +85,13 @@ The system:
 
 The compaction subsystem:
 
-- chunks transcripts with overlap
+- pre-cleans structured transcript items before compaction
+- preserves the newest raw turn outside compaction
+- chunks older transcript items with overlap at item boundaries
 - extracts durable session state via a compactor model
-- merges chunk state
+- merges chunk state deterministically
+- runs a constrained final refinement pass over merged state plus recent raw turns
+- reattaches the newest raw turn after refinement
 - writes Markdown and JSON handoff artifacts
 - rebuilds a Codex-ready prompt for later work
 

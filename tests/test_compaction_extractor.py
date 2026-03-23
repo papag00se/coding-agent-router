@@ -49,6 +49,37 @@ class TestCompactionExtractor(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-JSON output: not json"):
             extractor.extract_chunk(chunk)
 
+    def test_extract_chunk_normalizes_structured_test_status_and_plan(self):
+        client = _FakeClient(
+            (
+                '{"objective":"stabilize compaction",'
+                '"test_status":{"lcr-01":"closed","lcr-07a":"open"},'
+                '"latest_plan":['
+                '{"step":"Inspect repo/session state","status":"in_progress"},'
+                '{"step":"Implement upstream fix","status":"pending"}'
+                ']}'
+            )
+        )
+        extractor = CompactionExtractor(client=client, model="qwen-test", temperature=0.0, num_ctx=12000)
+        chunk = TranscriptChunk(chunk_id=2, start_index=0, end_index=1, token_count=100, items=[{"role": "user", "content": "fix it"}])
+
+        result = extractor.extract_chunk(chunk)
+
+        self.assertEqual(result.test_status, ["lcr-01: closed", "lcr-07a: open"])
+        self.assertEqual(
+            result.latest_plan,
+            ["Inspect repo/session state [in_progress]", "Implement upstream fix [pending]"],
+        )
+
+    def test_extract_chunk_normalizes_string_repo_state(self):
+        client = _FakeClient('{"repo_state":"Working in /repo with regions us-west-2 and us-east-1"}')
+        extractor = CompactionExtractor(client=client, model="qwen-test", temperature=0.0, num_ctx=12000)
+        chunk = TranscriptChunk(chunk_id=4, start_index=0, end_index=1, token_count=80, items=[{"role": "user", "content": "summarize state"}])
+
+        result = extractor.extract_chunk(chunk)
+
+        self.assertEqual(result.repo_state, {"summary": "Working in /repo with regions us-west-2 and us-east-1"})
+
     def test_extraction_prompt_is_explicit_and_payload_declares_contract(self):
         chunk = TranscriptChunk(chunk_id=1, start_index=0, end_index=1, token_count=50, items=[{"role": "user", "content": "rename it"}])
         payload = build_extraction_payload(chunk, {"repo": "coding-agent-router"})

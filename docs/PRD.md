@@ -166,6 +166,7 @@ The product must persist:
 - app-server thread state
 - chunk extractions
 - merged compaction state
+- refined compaction state
 - durable memory markdown
 - handoff JSON
 - transport logs

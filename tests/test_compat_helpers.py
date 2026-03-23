@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -328,3 +329,49 @@ class TestCompatHelpers(unittest.TestCase):
         )
         self.assertIn("response.function_call_arguments.done", final_with_text_and_tool)
         self.assertIn('"call_id": "call_2"', final_with_text_and_tool)
+
+    def test_iter_responses_progress_emits_keepalive_while_waiting_for_backend(self) -> None:
+        def delayed_events():
+            time.sleep(0.03)
+            yield {
+                "type": "final",
+                "response": {
+                    "model": "local_reasoner",
+                    "content": [{"type": "text", "text": "done"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            }
+
+        with patch.object(compat, "_SSE_KEEPALIVE_INTERVAL_SECONDS", 0.01):
+            payload = "".join(compat.iter_responses_progress(delayed_events(), {"model": "gpt-5.4"}))
+
+        self.assertIn(": keepalive", payload)
+        self.assertIn("response.completed", payload)
+
+    def test_iter_responses_progress_emits_progress_and_failed_events(self) -> None:
+        payload = "".join(
+            compat.iter_responses_progress(
+                [
+                    {
+                        "type": "progress",
+                        "stage": "extract_chunk_started",
+                        "message": "Extracting chunk 2 of 8. Waiting on local model (12s elapsed).",
+                        "heartbeat": True,
+                        "elapsed_seconds": 12,
+                        "chunk_id": 2,
+                        "chunk_index": 2,
+                        "chunk_count": 8,
+                    },
+                    {"type": "failed", "message": "inline compaction failed"},
+                ],
+                {"model": "gpt-5.4"},
+            )
+        )
+
+        self.assertIn("event: response.in_progress", payload)
+        self.assertIn("_compaction_progress", payload)
+        self.assertIn("Waiting on local model (12s elapsed).", payload)
+        self.assertIn('"elapsed_seconds": 12', payload)
+        self.assertIn('"chunk_count": 8', payload)
+        self.assertIn("event: response.failed", payload)
+        self.assertIn("inline compaction failed", payload)

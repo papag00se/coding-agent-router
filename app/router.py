@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .clients.codex_client import CodexCLIClient
 from .clients.ollama_client import OllamaClient
-from .compaction import CompactionService, render_codex_support_prompt
+from .compaction import CompactionService, render_codex_support_prompt, render_compacted_flow
 from .config import settings
 from .models import AnthropicMessagesRequest, InvokeRequest, InvokeResponse, RouteDecision
 from .prompt_loader import load_prompt
@@ -242,6 +244,7 @@ class RoutingService:
         current_request: str,
         repo_context: Optional[Dict[str, Any]] = None,
         refresh_if_needed: bool = False,
+        progress_callback: Optional[Callable[..., None]] = None,
     ) -> Dict[str, Any]:
         if refresh_if_needed:
             handoff = self.compaction_service.refresh_if_needed(
@@ -249,6 +252,7 @@ class RoutingService:
                 items,
                 current_request=current_request,
                 repo_context=repo_context,
+                progress_callback=progress_callback,
             )
         else:
             handoff = self.compaction_service.compact_transcript(
@@ -256,6 +260,7 @@ class RoutingService:
                 items,
                 current_request=current_request,
                 repo_context=repo_context,
+                progress_callback=progress_callback,
             )
         return handoff.model_dump()
 
@@ -267,18 +272,13 @@ class RoutingService:
         flow = self.compaction_service.build_codex_handoff_flow(session_id, current_request=current_request)
         return flow.model_dump() if flow is not None else None
 
-    def invoke_inline_compact_from_anthropic(self, req: AnthropicMessagesRequest) -> Dict[str, Any]:
-        transformed = anthropic_messages_to_prompt(req)
-        system = _strip_compaction_sentinel(transformed['system'] or '')
-        prompt = _strip_compaction_sentinel(transformed['prompt'])
-        raw = self.compactor_client.chat(
-            settings.compactor_model,
-            [{'role': 'user', 'content': prompt}],
-            temperature=settings.compactor_temperature,
-            num_ctx=settings.compactor_num_ctx,
-            system=system or load_prompt('conversation_compactor_system.md'),
-        )
-        text = raw.get('message', {}).get('content', '')
+    def invoke_inline_compact_from_anthropic(
+        self,
+        req: AnthropicMessagesRequest,
+        *,
+        progress_callback: Optional[Callable[..., None]] = None,
+    ) -> Dict[str, Any]:
+        text, raw_backend = self._inline_compaction_result(req, progress_callback=progress_callback)
         return {
             'id': 'msg_router_local',
             'type': 'message',
@@ -288,35 +288,22 @@ class RoutingService:
             'stop_reason': 'end_turn',
             'stop_sequence': None,
             'usage': {
-                'input_tokens': raw.get('prompt_eval_count', 0),
-                'output_tokens': raw.get('eval_count', 0),
+                'input_tokens': raw_backend['usage']['input_tokens'],
+                'output_tokens': raw_backend['usage']['output_tokens'],
             },
             'request_metadata': req.metadata or {},
-            'raw_backend': raw,
+            'raw_backend': raw_backend,
         }
 
-    def stream_inline_compact_from_anthropic(self, req: AnthropicMessagesRequest) -> Iterator[Dict[str, Any]]:
-        transformed = anthropic_messages_to_prompt(req)
-        system = _strip_compaction_sentinel(transformed['system'] or '')
-        prompt = _strip_compaction_sentinel(transformed['prompt'])
-        full_text = ''
-        final_raw: Dict[str, Any] = {}
-        for raw in self.compactor_client.chat_stream(
-            settings.compactor_model,
-            [{'role': 'user', 'content': prompt}],
-            temperature=settings.compactor_temperature,
-            num_ctx=settings.compactor_num_ctx,
-            system=system or load_prompt('conversation_compactor_system.md'),
-        ):
-            final_raw = raw
-            delta = (raw.get('message') or {}).get('content', '')
-            if delta:
-                full_text += delta
-                yield {'type': 'text_delta', 'delta': delta}
-        final_raw['usage'] = {
-            'input_tokens': final_raw.get('prompt_eval_count', 0),
-            'output_tokens': final_raw.get('eval_count', 0),
-        }
+    def stream_inline_compact_from_anthropic(
+        self,
+        req: AnthropicMessagesRequest,
+        *,
+        progress_callback: Optional[Callable[..., None]] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        full_text, final_raw = self._inline_compaction_result(req, progress_callback=progress_callback)
+        if full_text:
+            yield {'type': 'text_delta', 'delta': full_text}
         yield {
             'type': 'final',
             'response': {
@@ -332,6 +319,43 @@ class RoutingService:
                 'raw_backend': final_raw,
             },
         }
+
+    def _inline_compaction_result(
+        self,
+        req: AnthropicMessagesRequest,
+        *,
+        progress_callback: Optional[Callable[..., None]] = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        transcript_items, current_request = _inline_compaction_inputs(req)
+        session_id = _inline_compaction_session_id(req, transcript_items, current_request)
+        repo_context = _inline_compaction_repo_context(req.metadata)
+        handoff = self.compact_session(
+            session_id,
+            transcript_items,
+            current_request=current_request,
+            repo_context=repo_context,
+            progress_callback=progress_callback,
+        )
+        if progress_callback is not None:
+            progress_callback('inline_handoff_loaded', session_id=session_id)
+        flow = self.build_compaction_handoff_flow(session_id, current_request=current_request)
+        if flow is None:
+            raise RuntimeError(f'Inline compaction failed to build compacted flow for session {session_id}')
+        rendered = render_compacted_flow(flow, current_request=current_request)
+        if progress_callback is not None:
+            progress_callback('inline_render_completed', session_id=session_id)
+        raw_backend = {
+            'mode': 'chunked_durable_compaction',
+            'session_id': session_id,
+            'current_request': current_request,
+            'handoff': handoff,
+            'compacted_flow': flow,
+            'usage': {
+                'input_tokens': estimate_tokens(transcript_items),
+                'output_tokens': estimate_tokens(rendered),
+            },
+        }
+        return rendered, raw_backend
 
     def invoke_from_anthropic(self, req: AnthropicMessagesRequest) -> Dict[str, Any]:
         transformed = anthropic_messages_to_prompt(req)
@@ -615,8 +639,115 @@ def _normalize_stream_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _inline_compaction_inputs(req: AnthropicMessagesRequest) -> tuple[List[Dict[str, Any]], str]:
+    trigger_index: Optional[int] = None
+    for index in range(len(req.messages) - 1, -1, -1):
+        message = req.messages[index]
+        text = _content_text(message.content).strip()
+        if message.role == 'user' and settings.inline_compact_sentinel in text:
+            trigger_index = index
+            break
+
+    transcript_items: List[Dict[str, Any]] = []
+    latest_real_user = ''
+    fallback_request = ''
+    for index, message in enumerate(req.messages):
+        content = deepcopy(message.content)
+        if message.role == 'user' and index == trigger_index:
+            content = _strip_compaction_sentinel_from_content(content)
+            fallback_request = _content_text(content).strip()
+            continue
+        if _content_is_empty(content):
+            continue
+        if message.role == 'user':
+            text = _content_text(content).strip()
+            if text:
+                latest_real_user = text
+        transcript_items.append({'role': message.role, 'content': content})
+
+    current_request = latest_real_user or fallback_request
+    return transcript_items, current_request
+
+
+def _inline_compaction_session_id(
+    req: AnthropicMessagesRequest,
+    transcript_items: List[Dict[str, Any]],
+    current_request: str,
+) -> str:
+    metadata = req.metadata or {}
+    session_id = metadata.get('compaction_session_id') or metadata.get('session_id')
+    if isinstance(session_id, str) and session_id:
+        return session_id
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                'messages': transcript_items,
+                'current_request': current_request,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode('utf-8')
+    ).hexdigest()[:24]
+    return f'inline_{digest}'
+
+
+def _inline_compaction_repo_context(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    cwd = _codex_workdir(metadata)
+    return {'cwd': cwd} if cwd else {}
+
+
 def _strip_compaction_sentinel(text: str) -> str:
     sentinel = settings.inline_compact_sentinel
     if sentinel and sentinel in text:
         return text.replace(sentinel, '').strip()
     return text
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ''
+    parts: List[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get('type') in {'text', 'input_text', 'output_text'}:
+            text = item.get('text') or item.get('input_text') or item.get('output_text') or ''
+            if text:
+                parts.append(text)
+    return '\n'.join(parts)
+
+
+def _content_is_empty(content: Any) -> bool:
+    if isinstance(content, str):
+        return not content.strip()
+    if not isinstance(content, list):
+        return content is None
+    return not any(isinstance(item, dict) for item in content)
+
+
+def _strip_compaction_sentinel_from_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return _strip_compaction_sentinel(content)
+    if not isinstance(content, list):
+        return content
+
+    stripped: List[Dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        updated = dict(item)
+        if updated.get('type') in {'text', 'input_text', 'output_text'}:
+            text = updated.get('text') or updated.get('input_text') or updated.get('output_text') or ''
+            text = _strip_compaction_sentinel(text)
+            if not text:
+                continue
+            if 'text' in updated:
+                updated['text'] = text
+            elif 'input_text' in updated:
+                updated['input_text'] = text
+            elif 'output_text' in updated:
+                updated['output_text'] = text
+        stripped.append(updated)
+    return stripped
