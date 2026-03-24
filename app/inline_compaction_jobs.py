@@ -110,8 +110,11 @@ class InlineCompactionJobManager:
             self._cleanup_locked()
             existing = self._jobs.get(key)
             if existing is not None:
-                existing.updated_at = time.monotonic()
-                return existing, False
+                if existing.completed and existing.failure_message is not None:
+                    self._jobs.pop(key, None)
+                else:
+                    existing.updated_at = time.monotonic()
+                    return existing, False
             job = InlineCompactionJob(key=key, request_payload=dict(payload), request=request)
             self._jobs[key] = job
             worker = Thread(target=self._run_job, args=(job,), daemon=True)

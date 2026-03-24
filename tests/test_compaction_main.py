@@ -135,7 +135,13 @@ class TestCompactionMain(unittest.TestCase):
         upstream.content = json.dumps({'object': 'response', 'output_text': 'upstream'}).encode('utf-8')
         upstream.headers = {'content-type': 'application/json'}
         upstream.close = Mock()
-        with patch.object(compaction_main, 'service', service), patch.object(compaction_main._UPSTREAM, 'post', return_value=upstream) as post:
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_qualified_rate = 0.0
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(compaction_main._UPSTREAM, 'post', return_value=upstream) as post,
+            patch.object(compaction_main, 'settings', settings),
+        ):
             client = TestClient(compaction_main.app)
             response = client.post(
                 '/v1/responses',
@@ -151,6 +157,38 @@ class TestCompactionMain(unittest.TestCase):
         self.assertEqual(service.inline_requests, [])
         self.assertEqual(post.call_args.args[0], 'https://chatgpt.com/backend-api/codex/responses')
         self.assertEqual(post.call_args.kwargs['headers']['authorization'], 'Bearer test-token')
+        self.assertEqual(post.call_args.kwargs['json']['model'], 'gpt-5.4')
+
+    def test_responses_passthrough_rewrites_qualifying_requests_to_spark(self):
+        service = DummyInlineService()
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.content = json.dumps({'object': 'response', 'output_text': 'upstream'}).encode('utf-8')
+        upstream.headers = {'content-type': 'application/json'}
+        upstream.close = Mock()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        settings.codex_spark_qualified_rate = 1.0
+        payload = {
+            'model': 'gpt-5.4',
+            'input': [
+                {
+                    'type': 'function_call_output',
+                    'call_id': 'call_1',
+                    'output': "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(compaction_main._UPSTREAM, 'post', return_value=upstream) as post,
+            patch.object(compaction_main, 'settings', settings),
+        ):
+            client = TestClient(compaction_main.app)
+            response = client.post('/v1/responses', json=payload, headers={'Authorization': 'Bearer test-token'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(post.call_args.kwargs['json']['model'], 'gpt-5.3-codex-spark')
 
     def test_responses_stream_detects_inline_compaction_and_uses_local_service(self):
         service = DummyInlineService()
@@ -229,6 +267,51 @@ class TestCompactionMain(unittest.TestCase):
         self.assertIn('event: response.failed', response.text)
         self.assertIn('boom', response.text)
 
+    def test_failed_inline_compaction_job_is_not_reused(self):
+        class FlakyInlineService(DummyCompactionService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+
+            def stream_inline_compact_from_anthropic(self, req, *, progress_callback=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError('boom')
+                yield {
+                    'type': 'final',
+                    'response': {
+                        'id': 'msg_router_local',
+                        'type': 'message',
+                        'role': 'assistant',
+                        'model': 'qwen3.5-9b:iq4_xs',
+                        'content': [{'type': 'text', 'text': 'recovered summary'}],
+                        'usage': {'input_tokens': 5, 'output_tokens': 3},
+                    },
+                }
+
+        service = FlakyInlineService()
+        payload = {
+            'model': 'gpt-5.4',
+            'instructions': '<<<LOCAL_COMPACT>>> Summarize the thread.',
+            'input': [{'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Current thread'}]}],
+            'stream': True,
+        }
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(compaction_main, 'inline_compaction_jobs', compaction_main.InlineCompactionJobManager(service)),
+        ):
+            request = compaction_main.anthropic_request_from_responses(compaction_main.sanitize_inline_compaction_payload(payload))
+            job1, created1 = compaction_main.inline_compaction_jobs.get_or_create(payload, request)
+            with self.assertRaisesRegex(RuntimeError, 'boom'):
+                job1.wait()
+            job2, created2 = compaction_main.inline_compaction_jobs.get_or_create(payload, request)
+            final = job2.wait()
+
+        self.assertTrue(created1)
+        self.assertTrue(created2)
+        self.assertIsNot(job1, job2)
+        self.assertEqual(final['content'][0]['text'], 'recovered summary')
+
     def test_responses_ignores_sentinel_in_historical_tool_output(self):
         service = DummyInlineService()
         upstream = Mock()
@@ -275,7 +358,7 @@ class TestCompactionMain(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 409)
-        self.assertIn('app-server only', response.json()['error'])
+        self.assertIn('Unsupported transport', response.json()['error'])
         self.assertEqual(service.compact_calls, [])
 
     def test_ollama_chat_is_explicitly_unsupported(self):
@@ -291,7 +374,7 @@ class TestCompactionMain(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 409)
-        self.assertIn('app-server only', response.json()['error'])
+        self.assertIn('Unsupported transport', response.json()['error'])
         self.assertEqual(service.compact_calls, [])
 
     def test_anthropic_messages_is_explicitly_unsupported(self):
@@ -307,5 +390,5 @@ class TestCompactionMain(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 409)
-        self.assertIn('app-server only', response.json()['error'])
+        self.assertIn('Unsupported transport', response.json()['error'])
         self.assertEqual(service.compact_calls, [])

@@ -31,7 +31,7 @@ def render_compacted_flow(flow: CodexHandoffFlow | Dict[str, Any], *, current_re
         f"### {item['name']}\n{item['content'].rstrip()}" for item in payload.get("durable_memory") or []
     )
     return render_prompt(
-        "app_server_compacted_flow.md",
+        "compacted_flow.md",
         {
             "DURABLE_MEMORY_BLOCKS": durable_memory_blocks,
             "STRUCTURED_HANDOFF": json.dumps(payload.get("structured_handoff") or {}, ensure_ascii=False, indent=2),

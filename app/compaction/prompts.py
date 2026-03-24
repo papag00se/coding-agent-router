@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
-from ..task_metrics import estimate_tokens
+from ..config import settings
 from ..prompt_loader import load_prompt
-from .models import ChunkExtraction, MergedState, TranscriptChunk
+from ..task_metrics import estimate_model_tokens
+from .models import ChunkExtraction, MergedState, MergedStatePatch, TranscriptChunk
 
 
 EXTRACTION_SYSTEM_PROMPT = load_prompt('compaction_extraction_system.md')
@@ -20,7 +21,6 @@ def build_extraction_payload(chunk: TranscriptChunk, repo_context: Optional[Dict
                 "format": "json_object_only",
                 "required_keys": list(ChunkExtraction.model_fields.keys()),
             },
-            "schema": ChunkExtraction.model_json_schema(),
             "chunk": chunk.model_dump(),
             "repo_context": repo_context or {},
         },
@@ -28,8 +28,18 @@ def build_extraction_payload(chunk: TranscriptChunk, repo_context: Optional[Dict
     )
 
 
-def estimate_extraction_request_tokens(chunk: TranscriptChunk, repo_context: Optional[Dict[str, Any]] = None) -> int:
-    return estimate_tokens(EXTRACTION_SYSTEM_PROMPT) + estimate_tokens(build_extraction_payload(chunk, repo_context))
+def estimate_extraction_request_tokens(
+    chunk: TranscriptChunk,
+    repo_context: Optional[Dict[str, Any]] = None,
+    *,
+    model: Optional[str] = None,
+) -> int:
+    payload = build_extraction_payload(chunk, repo_context)
+    messages = [
+        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+        {"role": "user", "content": payload},
+    ]
+    return estimate_model_tokens(messages, model=model or settings.compactor_model)
 
 
 def build_refinement_payload(
@@ -40,12 +50,11 @@ def build_refinement_payload(
 ) -> str:
     return json.dumps(
         {
-            "task": "Refine merged durable coding-session state using newer recent raw turns.",
+            "task": "Return a bounded patch over merged durable coding-session state using newer recent raw turns.",
             "output_contract": {
                 "format": "json_object_only",
-                "required_keys": list(MergedState.model_fields.keys()),
+                "required_keys": list(MergedStatePatch.model_fields.keys()),
             },
-            "schema": MergedState.model_json_schema(),
             "current_state": state.model_dump(),
             "recent_raw_turns": recent_raw_turns,
             "current_request": current_request,
@@ -60,7 +69,12 @@ def estimate_refinement_request_tokens(
     recent_raw_turns: List[Dict[str, object]],
     current_request: str,
     repo_context: Optional[Dict[str, Any]] = None,
+    *,
+    model: Optional[str] = None,
 ) -> int:
-    return estimate_tokens(REFINEMENT_SYSTEM_PROMPT) + estimate_tokens(
-        build_refinement_payload(state, recent_raw_turns, current_request, repo_context)
-    )
+    payload = build_refinement_payload(state, recent_raw_turns, current_request, repo_context)
+    messages = [
+        {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
+        {"role": "user", "content": payload},
+    ]
+    return estimate_model_tokens(messages, model=model or settings.compactor_model)

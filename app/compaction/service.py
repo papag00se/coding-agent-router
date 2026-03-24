@@ -45,13 +45,28 @@ class CompactionService:
         )
         compactable, recent_raw_turns = split_recent_raw_turns(normalized.compactable_items, settings.compactor_keep_raw_tokens)
         recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, normalized.preserved_tail)
-        max_prompt_tokens = max(1, settings.compactor_num_ctx - settings.compactor_response_headroom_tokens)
+        target_prompt_tokens = max(
+            1,
+            settings.compactor_num_ctx
+            - settings.compactor_response_headroom_tokens
+            - getattr(self.extractor, "token_estimation_slack", 0),
+        )
+        max_prompt_tokens = max(
+            1,
+            settings.compactor_num_ctx
+            - getattr(self.extractor, "minimum_response_tokens", settings.compactor_response_headroom_tokens)
+            - getattr(self.extractor, "token_estimation_slack", 0),
+        )
         chunks, skipped_items = chunk_transcript_items_by_prompt(
             compactable,
-            target_prompt_tokens=min(settings.compactor_target_chunk_tokens, max_prompt_tokens),
+            target_prompt_tokens=min(settings.compactor_target_chunk_tokens, target_prompt_tokens, max_prompt_tokens),
             max_prompt_tokens=max_prompt_tokens,
             overlap_tokens=settings.compactor_overlap_tokens,
-            prompt_token_counter=lambda chunk: estimate_extraction_request_tokens(chunk, repo_context),
+            prompt_token_counter=lambda chunk: estimate_extraction_request_tokens(
+                chunk,
+                repo_context,
+                model=self.extractor.model,
+            ),
         )
         _emit_progress(
             progress_callback,
@@ -147,12 +162,54 @@ class CompactionService:
         state = merged
         remaining = list(recent_raw_turns)
         iteration = 0
-        total_iterations = _estimate_refinement_iterations(remaining, merged, current_request=current_request, repo_context=repo_context)
+        max_prompt_tokens = self._refinement_max_prompt_tokens()
+        target_prompt_tokens = self._refinement_target_prompt_tokens(max_prompt_tokens)
+        total_iterations = self._estimate_refinement_iterations(
+            remaining,
+            merged,
+            target_prompt_tokens=target_prompt_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            current_request=current_request,
+            repo_context=repo_context,
+        )
+        base_prompt_tokens = estimate_refinement_request_tokens(
+            state,
+            [],
+            current_request,
+            repo_context,
+            model=self.refiner.model,
+        )
+        if base_prompt_tokens > max_prompt_tokens:
+            _emit_progress(
+                progress_callback,
+                'refine_skipped',
+                reason='base_prompt_exceeds_budget',
+                prompt_tokens=base_prompt_tokens,
+                max_prompt_tokens=max_prompt_tokens,
+            )
+            return merged
         while remaining:
-            max_recent_tokens = self._refinement_recent_token_budget(state, current_request=current_request, repo_context=repo_context)
-            if max_recent_tokens <= 0:
-                break
-            chunk_items, next_index = _take_items_with_token_budget(remaining, max_recent_tokens)
+            chunk_items, next_index, skipped_oversize = _take_items_with_prompt_budget(
+                remaining,
+                target_prompt_tokens=target_prompt_tokens,
+                max_prompt_tokens=max_prompt_tokens,
+                prompt_token_counter=lambda candidate_items: estimate_refinement_request_tokens(
+                    state,
+                    candidate_items,
+                    current_request,
+                    repo_context,
+                    model=self.refiner.model,
+                ),
+            )
+            if skipped_oversize:
+                _emit_progress(
+                    progress_callback,
+                    'refine_item_skipped',
+                    reason='prompt_exceeds_budget',
+                    skipped_count=next_index,
+                )
+                remaining = remaining[next_index:]
+                continue
             if not chunk_items:
                 break
             iteration += 1
@@ -178,15 +235,67 @@ class CompactionService:
             )
         return state
 
-    def _refinement_recent_token_budget(
+    def _refinement_max_prompt_tokens(self) -> int:
+        return max(
+            1,
+            settings.compactor_num_ctx
+            - getattr(self.refiner, "minimum_response_tokens", settings.compactor_response_headroom_tokens)
+            - getattr(self.refiner, "token_estimation_slack", 0),
+        )
+
+    def _refinement_target_prompt_tokens(self, max_prompt_tokens: int) -> int:
+        return max(
+            1,
+            min(
+                max_prompt_tokens,
+                settings.compactor_num_ctx
+                - settings.compactor_response_headroom_tokens
+                - getattr(self.refiner, "token_estimation_slack", 0),
+            ),
+        )
+
+    def _estimate_refinement_iterations(
         self,
+        items: List[Dict[str, Any]],
         state: MergedState,
         *,
+        target_prompt_tokens: int,
+        max_prompt_tokens: int,
         current_request: str,
         repo_context: Optional[Dict[str, Any]] = None,
     ) -> int:
-        base_tokens = estimate_refinement_request_tokens(state, [], current_request, repo_context)
-        return max(0, settings.compactor_num_ctx - settings.compactor_response_headroom_tokens - base_tokens)
+        remaining = list(items)
+        iterations = 0
+        base_tokens = estimate_refinement_request_tokens(
+            state,
+            [],
+            current_request,
+            repo_context,
+            model=self.refiner.model,
+        )
+        if base_tokens > max_prompt_tokens:
+            return 0
+        while remaining:
+            chunk_items, next_index, skipped_oversize = _take_items_with_prompt_budget(
+                remaining,
+                target_prompt_tokens=target_prompt_tokens,
+                max_prompt_tokens=max_prompt_tokens,
+                prompt_token_counter=lambda candidate_items: estimate_refinement_request_tokens(
+                    state,
+                    candidate_items,
+                    current_request,
+                    repo_context,
+                    model=self.refiner.model,
+                ),
+            )
+            if skipped_oversize:
+                remaining = remaining[next_index:]
+                continue
+            if not chunk_items:
+                break
+            iterations += 1
+            remaining = remaining[next_index:]
+        return iterations
 
 
 def _merge_recent_raw_turns(existing: List[Dict[str, Any]], preserved_tail: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -197,22 +306,25 @@ def _merge_recent_raw_turns(existing: List[Dict[str, Any]], preserved_tail: List
     return merged
 
 
-def _take_items_with_token_budget(items: List[Dict[str, Any]], max_tokens: int) -> tuple[List[Dict[str, Any]], int]:
-    token_total = 0
-    selected: List[Dict[str, Any]] = []
-    index = 0
-    while index < len(items):
-        item_tokens = estimate_tokens(items[index])
-        if selected and token_total + item_tokens > max_tokens:
+def _take_items_with_prompt_budget(
+    items: List[Dict[str, Any]],
+    *,
+    target_prompt_tokens: int,
+    max_prompt_tokens: int,
+    prompt_token_counter: Callable[[List[Dict[str, Any]]], int],
+) -> tuple[List[Dict[str, Any]], int, bool]:
+    best_end = 0
+    for end in range(len(items)):
+        candidate_items = items[: end + 1]
+        prompt_tokens = prompt_token_counter(candidate_items)
+        if prompt_tokens > max_prompt_tokens:
             break
-        if not selected and item_tokens > max_tokens:
-            selected.append(items[index])
-            index += 1
+        best_end = end + 1
+        if prompt_tokens >= target_prompt_tokens:
             break
-        token_total += item_tokens
-        selected.append(items[index])
-        index += 1
-    return selected, index
+    if best_end == 0:
+        return [], 1 if items else 0, bool(items)
+    return items[:best_end], best_end, False
 
 
 def _emit_progress(
@@ -222,25 +334,3 @@ def _emit_progress(
 ) -> None:
     if progress_callback is not None:
         progress_callback(stage, **fields)
-
-
-def _estimate_refinement_iterations(
-    items: List[Dict[str, Any]],
-    state: MergedState,
-    *,
-    current_request: str,
-    repo_context: Optional[Dict[str, Any]] = None,
-) -> int:
-    remaining = list(items)
-    iterations = 0
-    while remaining:
-        base_tokens = estimate_refinement_request_tokens(state, [], current_request, repo_context)
-        max_recent_tokens = max(0, settings.compactor_num_ctx - settings.compactor_response_headroom_tokens - base_tokens)
-        if max_recent_tokens <= 0:
-            break
-        chunk_items, next_index = _take_items_with_token_budget(remaining, max_recent_tokens)
-        if not chunk_items:
-            break
-        iterations += 1
-        remaining = remaining[next_index:]
-    return iterations

@@ -18,11 +18,9 @@ This specification describes the current implementation, not an aspirational red
    Implemented by [`app/compat.py`](/home/jesse/src/coding-agent-router/app/compat.py).
 5. Tool translation layer
    Implemented by [`app/tool_adapter.py`](/home/jesse/src/coding-agent-router/app/tool_adapter.py) and [`app/tool_surface.py`](/home/jesse/src/coding-agent-router/app/tool_surface.py).
-6. App-server bridge
-   Implemented by [`app/app_server.py`](/home/jesse/src/coding-agent-router/app/app_server.py).
-7. Transcript compaction subsystem
+6. Transcript compaction subsystem
    Implemented under [`app/compaction/`](/home/jesse/src/coding-agent-router/app/compaction).
-8. Prompt loading and rendering
+7. Prompt loading and rendering
    Implemented by [`app/prompt_loader.py`](/home/jesse/src/coding-agent-router/app/prompt_loader.py) with prompt files in [`app/prompts`](/home/jesse/src/coding-agent-router/app/prompts).
 
 ## Configuration Model
@@ -69,11 +67,9 @@ Configuration is loaded from environment variables through [`app/config.py`](/ho
 - `COMPACTION_STATE_DIR`
 - `INLINE_COMPACT_SENTINEL`
 - `OPENAI_PASSTHROUGH_BASE_URL`
-- `APP_SERVER_STATE_DIR`
 
 ### Present but Not Operationally Significant
 
-- `APP_SERVER_MODE`
 - `ENABLE_INCREMENTAL_COMPACTION`
 - `COMPACTOR_MERGE_BATCH_SIZE`
 - `DEFAULT_CLOUD_BACKEND`
@@ -131,7 +127,6 @@ Defined in [`app/main.py`](/home/jesse/src/coding-agent-router/app/main.py).
 | `POST` | `/v1/chat/completions` | OpenAI Chat compatibility mapping |
 | `POST` | `/v1/responses` | OpenAI Responses compatibility mapping |
 | `POST` | `/api/chat` | Ollama chat compatibility mapping |
-| `WS` | `/app-server/ws` | Codex app-server bridge |
 
 ### Compaction Companion Service
 
@@ -139,7 +134,7 @@ Defined in [`app/compaction_main.py`](/home/jesse/src/coding-agent-router/app/co
 
 | Method | Path | Behavior |
 | --- | --- | --- |
-| `GET` | `/health` | Same as full router plus `app_server_mode=compaction_only` |
+| `GET` | `/health` | Same as full router |
 | `GET` | `/api/version` | Synthetic Ollama discovery |
 | `GET` | `/api/tags` | Synthetic Ollama discovery |
 | `GET` | `/v1/models` | Synthetic OpenAI discovery |
@@ -149,7 +144,6 @@ Defined in [`app/compaction_main.py`](/home/jesse/src/coding-agent-router/app/co
 | `POST` | `/v1/chat/completions` | Rejected with HTTP 409 |
 | `POST` | `/v1/responses` | Inline local compaction or upstream passthrough |
 | `POST` | `/api/chat` | Rejected with HTTP 409 |
-| `WS` | `/app-server/ws` | Codex app-server bridge with forced Codex backend |
 
 ## Routing Algorithm
 
@@ -297,7 +291,7 @@ Behavior:
 Current dynamic templates:
 
 - [`codex_support_prompt.md`](/home/jesse/src/coding-agent-router/app/prompts/codex_support_prompt.md)
-- [`app_server_compacted_flow.md`](/home/jesse/src/coding-agent-router/app/prompts/app_server_compacted_flow.md)
+- [`compacted_flow.md`](/home/jesse/src/coding-agent-router/app/prompts/compacted_flow.md)
 
 Current replacement tokens include:
 
@@ -398,68 +392,6 @@ Defined in [`app/tool_surface.py`](/home/jesse/src/coding-agent-router/app/tool_
 
 Mapped tool calls are restored to original names before final Responses output.
 
-## App-Server Bridge Specification
-
-Implemented in [`app/app_server.py`](/home/jesse/src/coding-agent-router/app/app_server.py).
-
-### Supported Methods
-
-- `initialize`
-- `thread/start`
-- `turn/start`
-- `thread/compact/start`
-- `initialized`
-
-### Thread State
-
-Persisted per thread as JSON under `APP_SERVER_STATE_DIR`.
-
-Stored fields include:
-
-- thread metadata
-- approval policy
-- cwd
-- model
-- model provider
-- sandbox policy
-- base instructions
-- developer instructions
-- turns
-- history items
-- compacted flow
-
-Prompt rendering note:
-
-- compacted follow-up context is rendered from [`app_server_compacted_flow.md`](/home/jesse/src/coding-agent-router/app/prompts/app_server_compacted_flow.md)
-
-### Turn Execution
-
-For `turn/start`:
-
-1. flatten client input items into user text
-2. build system prompt from base instructions and developer instructions
-3. append rendered compacted flow if present
-4. set metadata:
-   - `compaction_session_id`
-   - `session_id`
-   - `preferred_backend` in compaction-only mode
-   - `cwd`
-5. execute through `invoke_from_anthropic`
-6. emit `thread/status/changed`, `turn/started`, `item/started`, `item/completed`, `turn/completed`
-7. persist updated state
-
-### Thread Compaction
-
-For `thread/compact/start`:
-
-1. gather items from history and prior compacted flow
-2. derive current request from latest user turn or thread preview
-3. call transcript compaction
-4. rebuild compacted flow
-5. replace `history_items` with `recent_raw_turns`
-6. persist state
-7. emit `thread/compacted`
-
 ## Compaction Subsystem Specification
 
 ### Chunking
@@ -516,111 +448,34 @@ Implemented in [`app/compaction/refiner.py`](/home/jesse/src/coding-agent-router
 Behavior:
 
 - takes deterministic merged state as the source of truth
-- refines it with chunked `recent_raw_turns` in Ollama JSON mode
-- uses recent raw turns only to reprioritize, dedupe, clarify, or add explicitly visible facts
-- does not include the preserved newest raw turn in refinement input
-- reattaches the preserved newest raw turn after refinement
+- requests a bounded patch rather than a full state rewrite
+- rejects malformed or non-JSON model output
+- applies accepted patch fields deterministically onto merged state
 
 Prompt source:
 
 - [`compaction_refinement_system.md`](/home/jesse/src/coding-agent-router/app/prompts/compaction_refinement_system.md)
 
-### Durable Memory Rendering
+### Persistence
 
-Implemented in [`app/compaction/durable_memory.py`](/home/jesse/src/coding-agent-router/app/compaction/durable_memory.py).
+Artifacts are written under `COMPACTION_STATE_DIR/<session_id>/`.
 
-Rendered files:
+Persisted files include:
 
+- chunk extraction JSON
+- `merged-state.json`
+- `refined-state.json`
+- `handoff.json`
 - `TASK_STATE.md`
 - `DECISIONS.md`
 - `FAILURES_TO_AVOID.md`
 - `NEXT_STEPS.md`
 - `SESSION_HANDOFF.md`
 
-### Handoff Flow
+## Acceptance Notes
 
-Implemented in [`app/compaction/handoff.py`](/home/jesse/src/coding-agent-router/app/compaction/handoff.py).
+Current implementation guarantees only that:
 
-Output fields:
-
-- `durable_memory`
-- `structured_handoff`
-- `recent_raw_turns`
-- `current_request`
-
-Rendering note:
-
-- the final Codex support prompt is rendered from [`codex_support_prompt.md`](/home/jesse/src/coding-agent-router/app/prompts/codex_support_prompt.md)
-
-### Storage Layout
-
-Implemented in [`app/compaction/storage.py`](/home/jesse/src/coding-agent-router/app/compaction/storage.py).
-
-Per-session structure:
-
-- `<session>/chunks/chunk-<n>.json`
-- `<session>/merged-state.json`
-- `<session>/refined-state.json`
-- `<session>/handoff.json`
-- `<session>/TASK_STATE.md`
-- `<session>/DECISIONS.md`
-- `<session>/FAILURES_TO_AVOID.md`
-- `<session>/NEXT_STEPS.md`
-- `<session>/SESSION_HANDOFF.md`
-
-## Passthrough Proxy Rules
-
-Compaction companion passthrough behavior:
-
-- preserves request body
-- preserves most inbound headers
-- strips `host`, `content-length`, and `connection`
-- forwards to `OPENAI_PASSTHROUGH_BASE_URL + /responses`
-- streams bytes through unchanged when upstream streaming succeeds
-- logs transport metadata to `state/compaction_transport.jsonl`
-- can optionally include full before/after compaction payloads in that log when `LOG_COMPACTION_PAYLOADS=true`
-
-## Discovery Endpoint Semantics
-
-Discovery endpoints are compatibility shims, not backend truth:
-
-- `/v1/models` returns one synthetic `gpt-5.4` model entry unless a Codex cache file exists
-- `/api/version` returns `0.0.0-router`
-- `/api/tags` returns one synthetic `router` model tag
-
-## Deployment Artifacts
-
-Systemd unit generation is defined in [`scripts/render_systemd_units.py`](/home/jesse/src/coding-agent-router/scripts/render_systemd_units.py).
-
-Generated units:
-
-- [`deploy/systemd/coding-agent-router.service`](/home/jesse/src/coding-agent-router/deploy/systemd/coding-agent-router.service)
-- [`deploy/systemd/coding-agent-router-compaction.service`](/home/jesse/src/coding-agent-router/deploy/systemd/coding-agent-router-compaction.service)
-
-The generated units pin:
-
-- `uvicorn`
-- host `127.0.0.1`
-- dedicated ports `8080` and `8081`
-- explicit Ollama endpoints
-- explicit Codex CLI path
-
-## Verified Behavioral Invariants from Tests
-
-The test suite asserts all of the following:
-
-- route enum is locked to three values
-- local fallback prefers `local_coder`
-- router bypasses inference when digest size exceeds router context
-- coder tool recovery works for embedded and streaming tool JSON
-- Responses tool alias mapping round-trips
-- app-server thread state survives reload from disk
-- compaction writes handoff and durable memory files
-- compaction-only mode rejects unsupported transports
-- inline compaction sentinel detection ignores historical tool output
-
-## Known Technical Gaps
-
-- true streaming parity does not exist across all compatibility endpoints
-- some environment variables advertise behavior that the runtime does not implement
-- there is no internal execution engine for returned tool calls
+- route selection operates on a compact digest
+- compaction state survives reload from disk
+- inline compaction can be intercepted locally while ordinary Responses traffic is proxied upstream

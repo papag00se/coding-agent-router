@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .compaction_transport import compaction_payload_fields, record_transport_event
@@ -25,11 +25,9 @@ from .compat import (
 from .config import settings
 from .models import AnthropicMessagesRequest, CompactRequest, InvokeRequest
 from .router import RoutingService
-from .app_server import CodexAppServerBridge
 
 app = FastAPI(title="Local Agent Router Starter", version="0.1.0")
 service = RoutingService()
-app_server = CodexAppServerBridge(service)
 _TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
 
 
@@ -131,7 +129,3 @@ def ollama_chat(req: Dict[str, Any]):
         return StreamingResponse(iter_ollama_chat_response(response), media_type="application/x-ndjson")
     return JSONResponse(ollama_chat_response(response))
 
-
-@app.websocket("/app-server/ws")
-async def codex_app_server(websocket: WebSocket):
-    await app_server.handle_websocket(websocket)

@@ -16,6 +16,19 @@ _STRING_LIST_FIELDS = (
     "external_references",
 )
 
+_PATCH_STRING_LIST_FIELDS = (
+    "add_files_touched",
+    "add_commands_run",
+    "add_errors",
+    "add_accepted_fixes",
+    "add_rejected_ideas",
+    "add_constraints",
+    "add_environment_assumptions",
+    "add_pending_todos",
+    "add_unresolved_bugs",
+    "add_external_references",
+)
+
 
 def normalize_chunk_extraction_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(payload)
@@ -34,6 +47,17 @@ def normalize_merged_state_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized[field_name] = _normalize_string_list(normalized.get(field_name))
     normalized["test_status"] = _normalize_test_status(normalized.get("test_status"))
     normalized["latest_plan"] = _normalize_latest_plan(normalized.get("latest_plan"))
+    return normalized
+
+
+def normalize_merged_state_patch_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload)
+    normalized["objective_update"] = _stringify_scalar(normalized.get("objective_update"))
+    normalized["repo_state_updates"] = _normalize_repo_state(normalized.get("repo_state_updates"))
+    for field_name in _PATCH_STRING_LIST_FIELDS:
+        normalized[field_name] = _normalize_string_list(normalized.get(field_name))
+    normalized["add_test_status"] = _normalize_test_status(normalized.get("add_test_status"))
+    normalized["latest_plan_update"] = _normalize_latest_plan(normalized.get("latest_plan_update"))
     return normalized
 
 

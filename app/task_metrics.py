@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any, Dict, Iterable, List, Mapping
 
+import tiktoken
+
 
 FILE_EXTENSIONS = (
     'py',
@@ -70,6 +72,18 @@ def estimate_tokens(value: Any) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+def estimate_model_tokens(value: Any, *, model: str) -> int:
+    text = _stringify(value)
+    if not text:
+        return 0
+    encoding = _encoding_for_openai_model(model)
+    return len(encoding.encode(text))
+
+
+def estimate_openai_tokens(value: Any, *, model: str) -> int:
+    return estimate_model_tokens(value, model=model)
+
+
 def extract_task_metrics(
     prompt: str,
     trajectory: Any = None,
@@ -120,6 +134,16 @@ def _stringify(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
     except TypeError:
         return str(value)
+
+
+def _encoding_for_openai_model(model: str):
+    normalized = (model or '').strip().lower()
+    if normalized.startswith('gpt-5') or 'codex' in normalized:
+        return tiktoken.get_encoding('o200k_base')
+    try:
+        return tiktoken.encoding_for_model(model)
+    except KeyError:
+        return tiktoken.get_encoding('o200k_base')
 
 
 def _line_count(text: str) -> int:

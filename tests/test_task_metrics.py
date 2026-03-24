@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from app import task_metrics
-from app.task_metrics import extract_task_metrics
+from app.task_metrics import estimate_openai_tokens, estimate_tokens, extract_task_metrics
 
 
 class TestTaskMetricsExtractor(unittest.TestCase):
@@ -72,3 +72,25 @@ class TestTaskMetricsExtractor(unittest.TestCase):
         self.assertEqual(task_metrics._line_count(""), 0)
         self.assertEqual(task_metrics._message_like_items({"messages": [{"role": "user", "content": "hi"}, {"content": "skip"}]}), [{"role": "user", "content": "hi"}])
         self.assertEqual(task_metrics._attempt_items({"attempts": "bad"}), [])
+
+
+class TestOpenAITokenEstimator(unittest.TestCase):
+    def test_estimate_openai_tokens_uses_real_tokenizer_for_gpt5_family(self) -> None:
+        payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Command: /bin/bash -lc 'sed -n \"1,200p\" app/router.py'\nOutput:\nfrom app import router\n",
+                }
+            ],
+        }
+        rough = estimate_tokens(payload)
+        exactish = estimate_openai_tokens(payload, model="gpt-5.4")
+        self.assertGreater(exactish, 0)
+        self.assertNotEqual(exactish, rough)
+
+    def test_estimate_openai_tokens_supports_codex_spark_model_name(self) -> None:
+        payload = {"model": "gpt-5.3-codex-spark", "input": [{"type": "message", "role": "user", "content": "hi"}]}
+        self.assertGreater(estimate_openai_tokens(payload, model="gpt-5.3-codex-spark"), 0)

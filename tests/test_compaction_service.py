@@ -16,6 +16,7 @@ FIXTURE_PATH = Path(__file__).parent / "fixtures" / "codex_support_transcript_la
 
 class _FakeExtractor:
     def __init__(self) -> None:
+        self.model = "qwen-test"
         self.calls = []
 
     def extract_chunk(self, chunk, repo_context=None):
@@ -33,6 +34,7 @@ class _FakeExtractor:
 
 class _FakeRefiner:
     def __init__(self) -> None:
+        self.model = "qwen-test"
         self.calls = []
 
     def refine_state(self, state, recent_raw_turns, *, current_request, repo_context=None):
@@ -234,7 +236,7 @@ class TestCompactionService(unittest.TestCase):
                 ),
             ), patch(
                 "app.compaction.service.estimate_extraction_request_tokens",
-                side_effect=lambda chunk, repo_context=None: 2600 if any(item["content"] == "oversize" for item in chunk.items) else 800,
+                side_effect=lambda chunk, repo_context=None, model=None: 2600 if any(item["content"] == "oversize" for item in chunk.items) else 800,
             ):
                 handoff = service.compact_transcript(
                     "session-prompt-oversize",
@@ -250,3 +252,42 @@ class TestCompactionService(unittest.TestCase):
         extracted_contents = [item["content"] for chunk, _repo_context in extractor.calls for item in chunk.items]
         self.assertEqual(extracted_contents, ["small", "small-two"])
         self.assertIn({"role": "assistant", "content": "oversize"}, handoff.recent_raw_turns)
+
+    def test_compact_transcript_skips_refinement_items_that_cannot_fit_minimum_output_budget(self):
+        extractor = _FakeExtractor()
+        refiner = _FakeRefiner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = CompactionService(extractor=extractor, refiner=refiner, storage=CompactionStorage(Path(tmpdir)))
+            with patch(
+                "app.compaction.service.settings",
+                SimpleNamespace(
+                    compactor_keep_raw_tokens=24,
+                    compactor_target_chunk_tokens=1200,
+                    compactor_max_chunk_tokens=1600,
+                    compactor_overlap_tokens=0,
+                    compactor_num_ctx=2000,
+                    compactor_response_headroom_tokens=512,
+                ),
+            ), patch(
+                "app.compaction.service.estimate_refinement_request_tokens",
+                side_effect=lambda state, recent_raw_turns, current_request, repo_context=None, model=None: (
+                    1800 if recent_raw_turns and recent_raw_turns[0]["content"] == "oversize raw turn" else 900
+                ),
+            ):
+                handoff = service.compact_transcript(
+                    "session-refine-oversize",
+                    [
+                        {"role": "user", "content": "compactable context " + ("x" * 1200)},
+                        {"role": "assistant", "content": "oversize raw turn"},
+                        {"role": "user", "content": "small raw turn"},
+                        {"role": "assistant", "content": "latest raw"},
+                    ],
+                    current_request="continue",
+                )
+
+        self.assertEqual(len(refiner.calls), 1)
+        self.assertEqual(
+            [item["content"] for item in refiner.calls[0]["recent_raw_turns"]],
+            ["small raw turn", "latest raw"],
+        )
+        self.assertIn({"role": "assistant", "content": "oversize raw turn"}, handoff.recent_raw_turns)

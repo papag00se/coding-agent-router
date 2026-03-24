@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from typing import Any, Dict, Iterable
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .app_server import CodexAppServerBridge
 from .compaction.normalize import sanitize_inline_compaction_payload
 from .compaction_transport import compaction_payload_fields, record_transport_event
 from .compat import (
@@ -22,13 +24,15 @@ from .config import settings
 from .inline_compaction_jobs import InlineCompactionJobManager, inline_compaction_request_key
 from .models import CompactRequest, InvokeRequest
 from .router import RoutingService
+from .task_metrics import estimate_openai_tokens, estimate_tokens
 
 app = FastAPI(title="Local Agent Router Compaction Service", version="0.1.0")
 service = RoutingService()
-app_server = CodexAppServerBridge(service, mode="compaction_only")
 inline_compaction_jobs = InlineCompactionJobManager(service)
 _TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
 _UPSTREAM = requests.Session()
+_SPARK_MAX_REQUEST_TOKENS = 100_000
+_SHELL_WRAPPER = re.compile(r"^(?:/bin/)?bash\s+-lc\s+(['\"])(?P<inner>.*)\1$", re.DOTALL)
 
 
 def _record_transport_event(event: str, **fields: Any) -> None:
@@ -56,12 +60,7 @@ def _log_inline_compaction_stream(events: Iterable[Dict[str, Any]], payload: Dic
 def _unsupported_transport_response(transport: str) -> JSONResponse:
     _record_transport_event('unsupported_transport', transport=transport)
     return JSONResponse(
-        {
-            'error': (
-                'The compaction service is app-server only. '
-                'Use /app-server/ws for extension traffic and thread/compact/start for local compaction.'
-            )
-        },
+        {'error': 'Unsupported transport for the compaction companion service.'},
         status_code=409,
     )
 
@@ -131,13 +130,136 @@ def _auth_header_kind(headers: Dict[str, str]) -> str:
     return 'other'
 
 
+def _rewrite_passthrough_payload_for_spark(payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    request_tokens = estimate_openai_tokens(payload, model=str(payload.get('model') or 'gpt-5.4'))
+    category = _qualifying_spark_category(payload)
+    eligible = (
+        payload.get('model') == 'gpt-5.4'
+        and request_tokens < _SPARK_MAX_REQUEST_TOKENS
+        and category is not None
+    )
+    sample_value = _stable_sample_value(payload)
+    applied = eligible and sample_value < settings.codex_spark_qualified_rate
+    if not applied:
+        return payload, {
+            'applied': False,
+            'eligible': eligible,
+            'category': category,
+            'request_tokens': request_tokens,
+            'sample_value': sample_value,
+        }
+    rewritten = dict(payload)
+    rewritten['model'] = settings.codex_spark_model
+    return rewritten, {
+        'applied': True,
+        'eligible': True,
+        'category': category,
+        'request_tokens': request_tokens,
+        'sample_value': sample_value,
+    }
+
+
+def _qualifying_spark_category(payload: Dict[str, Any]) -> str | None:
+    latest_item = _latest_significant_input_item(payload.get('input'))
+    if not isinstance(latest_item, dict) or latest_item.get('type') != 'function_call_output':
+        return None
+    output = latest_item.get('output')
+    if not isinstance(output, str) or not output:
+        return None
+    command = _extract_command_from_tool_output(output)
+    if not command:
+        return None
+    if _is_file_read_command(command):
+        return 'file_read'
+    if _is_search_inventory_command(command):
+        return 'search_inventory'
+    if _is_targeted_test_command(command):
+        return 'targeted_test'
+    if _is_polling_command(command, output):
+        return 'polling'
+    return None
+
+
+def _latest_significant_input_item(input_items: Any) -> Dict[str, Any] | None:
+    if not isinstance(input_items, list):
+        return None
+    for item in reversed(input_items):
+        if not isinstance(item, dict):
+            continue
+        if item.get('type') == 'reasoning':
+            continue
+        return item
+    return None
+
+
+def _extract_command_from_tool_output(output: str) -> str:
+    first_line = output.splitlines()[0].strip()
+    if not first_line.startswith('Command:'):
+        return ''
+    command = first_line[len('Command:'):].strip()
+    wrapped = _SHELL_WRAPPER.match(command)
+    if wrapped:
+        return wrapped.group('inner').strip()
+    if len(command) >= 2 and command[0] == command[-1] and command[0] in {'"', "'"}:
+        return command[1:-1].strip()
+    return command
+
+
+def _is_file_read_command(command: str) -> bool:
+    return (
+        command.startswith('sed -n ')
+        or command.startswith('cat ')
+        or command.startswith('nl -ba ')
+    )
+
+
+def _is_search_inventory_command(command: str) -> bool:
+    return (
+        'rg -n ' in command
+        or command.startswith('rg --files')
+        or command.startswith('find ')
+        or command.startswith('ls ')
+        or command.startswith('stat ')
+        or command.startswith('wc -')
+        or command.startswith('du -')
+    )
+
+
+def _is_targeted_test_command(command: str) -> bool:
+    if 'pytest' not in command and 'unittest' not in command:
+        return False
+    return 'tests/' in command or 'tests.' in command
+
+
+def _is_polling_command(command: str, output: str) -> bool:
+    if 'Process running with session ID' in output:
+        return True
+    return (
+        command.startswith('journalctl ')
+        or command.startswith('tail -n ')
+        or command.startswith('tail -f ')
+        or command.startswith('ss -tnp')
+        or command.startswith('ps -eo')
+        or command.startswith('sleep ')
+        or command == 'date'
+        or command.startswith('date;')
+        or command.startswith('systemctl ')
+    )
+
+
+def _stable_sample_value(payload: Dict[str, Any]) -> float:
+    digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')).digest()
+    return int.from_bytes(digest[:8], 'big') / float(1 << 64)
+
+
 def _proxy_response(request: Request, path: str, payload: Dict[str, Any]) -> Response:
     headers = _proxy_headers(request)
     stream = bool(payload.get('stream'))
     url = _proxy_url(path)
+    upstream_payload, rewrite = _rewrite_passthrough_payload_for_spark(payload)
     upstream = _UPSTREAM.post(
         url,
-        json=payload,
+        json=upstream_payload,
         headers=headers,
         timeout=(settings.ollama_connect_timeout_seconds, settings.codex_timeout_seconds),
         stream=stream,
@@ -149,6 +271,13 @@ def _proxy_response(request: Request, path: str, payload: Dict[str, Any]) -> Res
         stream=stream,
         status=upstream.status_code,
         auth_header=_auth_header_kind(headers),
+        original_model=payload.get('model'),
+        upstream_model=upstream_payload.get('model'),
+        spark_rewrite_applied=rewrite['applied'],
+        spark_eligible=rewrite['eligible'],
+        spark_category=rewrite['category'],
+        spark_request_tokens=rewrite['request_tokens'],
+        spark_sample_value=rewrite['sample_value'],
     )
     if not stream or upstream.status_code >= 400:
         body = upstream.content
@@ -175,7 +304,6 @@ def health() -> dict:
         "coder_model": settings.coder_model,
         "reasoner_model": settings.reasoner_model,
         "codex_cli_enabled": settings.enable_codex_cli,
-        "app_server_mode": "compaction_only",
     }
 
 
@@ -290,7 +418,3 @@ async def openai_responses(request: Request):
 def ollama_chat(_: Dict[str, Any]):
     return _unsupported_transport_response('ollama_chat')
 
-
-@app.websocket("/app-server/ws")
-async def codex_app_server(websocket: WebSocket):
-    await app_server.handle_websocket(websocket)

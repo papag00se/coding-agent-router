@@ -5,35 +5,34 @@ Do not use markdown fences.
 Do not explain your answer.
 Do not include prose before or after the JSON.
 
-This is a constrained refinement pass:
+This is a bounded patch pass, not a full state rewrite.
 - start from current_state as the source of truth
+- only emit patch fields; do not re-emit the full state object
 - use recent_raw_turns only to reprioritize, dedupe, clarify, or add facts that are explicitly visible there
 - prefer newer facts over older facts
 - never invent facts, file paths, commands, errors, or plans
-- if unsure, keep the existing current_state value or omit the fact
+- if unsure, leave the patch field empty
 - empty strings, empty arrays, and empty objects are valid
+- do not include merged_chunk_count in the patch
 
-Refinement goals:
-- keep the latest stable objective
-- promote the most recent active plan into latest_plan
-- keep unresolved work current and deduped
-- keep failures and rejected ideas distinct
-- keep repo_state concrete and factual
-- preserve merged_chunk_count from current_state
+Patch goals:
+- optionally update objective if recent_raw_turns clearly changed it
+- optionally replace latest_plan if recent_raw_turns contain a newer active plan
+- optionally append newly visible files/commands/errors/fixes/constraints/todos/bugs/test results/external references
+- optionally add concrete repo_state_updates for facts explicitly visible in recent_raw_turns
 
 Field rules:
-- objective: latest stable task objective
-- repo_state: concrete repo facts only
-- files_touched: real file paths mentioned or acted on
-- commands_run: shell commands actually run or explicitly prepared to run
-- errors: concrete failures, parser errors, bad outputs, or broken behaviors
-- accepted_fixes: fixes already applied or clearly accepted
-- rejected_ideas: ideas explicitly rejected or shown to fail
-- constraints: instructions or requirements that constrain future work
-- environment_assumptions: concrete environment or infrastructure assumptions explicitly referenced
-- pending_todos: remaining concrete tasks
-- unresolved_bugs: still-open bugs or failure modes
-- test_status: concrete test outcomes or stated test state
-- external_references: endpoints, hosts, credentials, services, model tags, or external docs referenced
-- latest_plan: most recent active plan steps if present, otherwise []
-- merged_chunk_count: copy from current_state unless the payload explicitly says otherwise
+- objective_update: latest stable task objective if it changed, else ""
+- repo_state_updates: concrete repo facts only; only keys that should be added or updated
+- add_files_touched: real file paths mentioned or acted on
+- add_commands_run: shell commands actually run or explicitly prepared to run
+- add_errors: concrete failures, parser errors, bad outputs, or broken behaviors
+- add_accepted_fixes: fixes already applied or clearly accepted
+- add_rejected_ideas: ideas explicitly rejected or shown to fail
+- add_constraints: instructions or requirements that constrain future work
+- add_environment_assumptions: concrete environment or infrastructure assumptions explicitly referenced
+- add_pending_todos: remaining concrete tasks
+- add_unresolved_bugs: still-open bugs or failure modes
+- add_test_status: concrete test outcomes or stated test state
+- add_external_references: endpoints, hosts, credentials, services, model tags, or external docs referenced
+- latest_plan_update: most recent active plan steps if present, otherwise []

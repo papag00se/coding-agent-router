@@ -16,7 +16,6 @@ Users running coding agents locally need a single gateway that can:
 - choose an execution backend appropriate to the task
 - preserve long-running coding context without resending the entire transcript
 - optionally escalate into Codex CLI when local routing or local context windows are not enough
-- fit into Codex app-server style workflows
 
 ## Target Users
 
@@ -30,7 +29,7 @@ Needs one endpoint that can sit in front of coding clients speaking Anthropic, O
 
 ### Long-Running Session Operator
 
-Needs transcript state to survive large histories and thread restarts.
+Needs transcript state to survive large histories and restarts.
 
 ## Product Goals
 
@@ -39,7 +38,6 @@ Needs transcript state to survive large histories and thread restarts.
 - Preserve compatibility with several upstream request formats.
 - Support tool-aware coding requests where the backend can produce structured tool calls.
 - Preserve session continuity through durable transcript compaction.
-- Fit into Codex app-server flows, including explicit thread compaction.
 - Allow an operator to keep ordinary Responses traffic pointed at upstream while intercepting local compaction behavior.
 
 ## Non-Goals
@@ -130,40 +128,32 @@ The product must support progressive SSE output for the OpenAI Responses API in 
 
 Status: Implemented.
 
-### FR12. App-Server Thread Lifecycle
-
-The product must support starting threads, running turns, compacting threads, and persisting thread state for app-server clients.
-
-Status: Implemented.
-
-### FR13. Transcript Compaction
+### FR12. Transcript Compaction
 
 The product must compact long transcripts into persisted durable memory plus a structured handoff.
 
 Status: Implemented.
 
-### FR14. Codex-Oriented Handoff Reconstruction
+### FR13. Codex-Oriented Handoff Reconstruction
 
 For sessions with compaction state, the product must be able to reconstruct a Codex-ready prompt containing durable memory, structured handoff, recent raw turns, and the current request.
 
 Status: Implemented.
 
-### FR15. Compaction Companion Mode
+### FR14. Compaction Companion Mode
 
 The product must support a mode where:
 
-- app-server traffic is local
 - inline compaction requests are local
 - ordinary `/v1/responses` traffic is proxied upstream
 - other compatibility endpoints are explicitly rejected
 
 Status: Implemented.
 
-### FR16. Disk Persistence
+### FR15. Disk Persistence
 
 The product must persist:
 
-- app-server thread state
 - chunk extractions
 - merged compaction state
 - refined compaction state
@@ -173,13 +163,13 @@ The product must persist:
 
 Status: Implemented.
 
-### FR17. File-Backed Application Prompts
+### FR16. File-Backed Application Prompts
 
 The product must keep application prompts as separate files under `app/prompts` rather than embedding long prompt bodies directly in Python modules.
 
 Status: Implemented.
 
-### FR18. Template-Based Dynamic Prompt Rendering
+### FR17. Template-Based Dynamic Prompt Rendering
 
 The product must support dynamic prompt sections by explicit placeholder replacement instead of scattered inline string assembly.
 
@@ -201,7 +191,7 @@ Status: Implemented.
 
 ### NFR3. Stable On-Disk State
 
-Thread and compaction artifacts should be restart-safe and reloadable from disk.
+Compaction artifacts should be restart-safe and reloadable from disk.
 
 Status: Implemented.
 
@@ -219,8 +209,6 @@ Status: Implemented.
 
 ## Current Gaps Between Product Appearance and Product Reality
 
-These are important requirements clarifications because they are easy to misunderstand from endpoint names or config names alone.
-
 ### GR1. Streaming Is Not Uniform
 
 - `/v1/responses` is truly progressive in the full router
@@ -235,7 +223,6 @@ Requirement implication:
 
 The following settings exist but are not wired into active behavior:
 
-- `APP_SERVER_MODE`
 - `ENABLE_INCREMENTAL_COMPACTION`
 - `COMPACTOR_MERGE_BATCH_SIZE`
 - `DEFAULT_CLOUD_BACKEND`
@@ -270,7 +257,6 @@ The product should be considered functionally correct when:
 - structured tool calls survive a local coder round trip
 - route selection excludes backends that cannot fit the request context
 - a long transcript can be compacted into durable memory and reloaded later
-- app-server clients can resume a persisted thread after restart
 - compaction-only mode can intercept inline compaction while proxying ordinary Responses traffic upstream
 
 ## Risks
@@ -282,8 +268,6 @@ The product should be considered functionally correct when:
 - synthetic model discovery can confuse clients that expect backend enumeration
 
 ## Requirement Backlog Suggested by the Implementation
-
-These are the most obvious next requirements if the product is to mature beyond its current shape.
 
 - make streaming semantics consistent across all compatibility endpoints
 - either wire or delete dormant config toggles

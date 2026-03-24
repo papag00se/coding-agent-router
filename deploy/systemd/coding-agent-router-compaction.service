@@ -23,7 +23,6 @@ Environment=COMPACTOR_MODEL=qwen3.5-9b:iq4_xs
 Environment=ENABLE_CODEX_CLI=true
 Environment=CODEX_CMD=/home/jesse/.nvm/versions/node/v22.13.1/bin/codex
 Environment=CODEX_WORKDIR=/home/jesse/src/coding-agent-router
-Environment=APP_SERVER_STATE_DIR=/home/jesse/src/coding-agent-router/state/app_server_compaction
 ExecStart=/home/jesse/src/coding-agent-router/.venv/bin/uvicorn app.compaction_main:app --host 127.0.0.1 --port 8081
 Restart=always
 RestartSec=2

@@ -2,12 +2,12 @@
 
 ## System Shape
 
-The repository currently implements two related services:
+The repository implements two related HTTP services:
 
-- a full router service in [`app/main.py`](/home/jesse/src/coding-agent-router/app/main.py)
-- a compaction companion service in [`app/compaction_main.py`](/home/jesse/src/coding-agent-router/app/compaction_main.py)
+- the full router in [`app/main.py`](/home/jesse/src/coding-agent-router/app/main.py)
+- the compaction companion in [`app/compaction_main.py`](/home/jesse/src/coding-agent-router/app/compaction_main.py)
 
-Both services share the same routing core in [`app/router.py`](/home/jesse/src/coding-agent-router/app/router.py).
+Both share the same routing core in [`app/router.py`](/home/jesse/src/coding-agent-router/app/router.py).
 
 ## High-Level Flow
 
@@ -15,53 +15,41 @@ Both services share the same routing core in [`app/router.py`](/home/jesse/src/c
 client
   -> compatibility layer / native invoke
   -> routing digest + route selection
-  -> local coder | local reasoner | codex cli
+  -> local_coder | local_reasoner | codex_cli
   -> compatibility response mapping
-```
-
-For long-running app-server sessions:
-
-```text
-app-server client
-  -> /app-server/ws
-  -> persisted thread state
-  -> optional thread compaction
-  -> durable memory + structured handoff
-  -> follow-up turns with compacted context
 ```
 
 ## Main Components
 
-### API and Compatibility Surface
+### API Surface
 
-The API layer accepts:
+The runtime accepts:
 
 - native `/invoke`
 - Anthropic `/v1/messages`
 - OpenAI `/v1/chat/completions`
 - OpenAI `/v1/responses`
 - Ollama `/api/chat`
-- app-server WebSocket traffic
+- internal `/internal/compact`
 
-Request and response translation is implemented in [`app/compat.py`](/home/jesse/src/coding-agent-router/app/compat.py).
+Request and response translation lives in [`app/compat.py`](/home/jesse/src/coding-agent-router/app/compat.py).
 
 ### Route Selection
 
-The router does not send the full conversation to the router model. It builds a smaller metrics digest that includes:
+The router builds a compact digest rather than sending full history to the router model. The digest includes:
 
 - latest user prompt
 - trajectory summary payload
 - token and structure metrics
-- context-window constraints
+- configured context constraints
 - eligible routes
 
 Route selection then:
 
 - honors explicit backend overrides
-- removes local routes that exceed backend context limits
-- bypasses inference when the digest is itself too large
-- falls back deterministically if router output is invalid
-- loads route-selection prompt text from [`app/prompts`](/home/jesse/src/coding-agent-router/app/prompts)
+- removes local backends that cannot fit the request
+- bypasses inference when the routing digest itself is too large
+- falls back deterministically if the router output is invalid
 
 ### Execution Backends
 
@@ -87,7 +75,7 @@ The compaction subsystem:
 
 - pre-cleans structured transcript items before compaction
 - preserves the newest raw turn outside compaction
-- chunks older transcript items with overlap at item boundaries
+- chunks older transcript items at item boundaries
 - extracts durable session state via a compactor model
 - merges chunk state deterministically
 - runs a constrained final refinement pass over merged state plus recent raw turns
@@ -97,25 +85,21 @@ The compaction subsystem:
 
 ### Prompt Files
 
-Application prompts are stored as Markdown files under [`app/prompts`](/home/jesse/src/coding-agent-router/app/prompts) and loaded through [`prompt_loader.py`](/home/jesse/src/coding-agent-router/app/prompt_loader.py).
+Application prompts are stored under [`app/prompts`](/home/jesse/src/coding-agent-router/app/prompts) and loaded through [`app/prompt_loader.py`](/home/jesse/src/coding-agent-router/app/prompt_loader.py).
 
-Static prompts such as router, coder, reasoner, and compactor system instructions are plain `.md` files.
+Static prompts such as router, coder, reasoner, and compactor instructions are plain Markdown files.
 
-Dynamic prompts such as the Codex support prompt and the app-server compacted-flow prompt use explicit placeholder replacement for sections like current request, durable memory, and structured handoff.
-
-### App-Server Bridge
-
-The bridge persists per-thread state, serves turns over WebSocket, and can replace older raw history with compacted handoff state after `thread/compact/start`.
+Dynamic prompts such as the Codex support prompt and compacted-flow prompt use explicit placeholder replacement for sections like current request, durable memory, and structured handoff.
 
 ## Service Modes
 
 ### Full Router
 
-Used when the service itself should terminate client traffic and execute locally.
+Used when the service should terminate client traffic and execute locally.
 
 ### Compaction Companion
 
-Used when app-server and inline local compaction should run locally, while ordinary `/v1/responses` traffic is proxied upstream.
+Used when inline local compaction should run locally, while ordinary `/v1/responses` traffic is proxied upstream.
 
 ## Further Docs
 

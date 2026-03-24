@@ -33,7 +33,13 @@ class TestCompactionExtractor(unittest.TestCase):
         client = _FakeClient(
             '{"objective":"rename service","files_touched":["README.md"],"constraints":["keep change minimal"]}'
         )
-        extractor = CompactionExtractor(client=client, model="qwen-test", temperature=0.0, num_ctx=12000)
+        extractor = CompactionExtractor(
+            client=client,
+            model="qwen-test",
+            temperature=0.0,
+            num_ctx=12000,
+            max_output_tokens=2048,
+        )
         chunk = TranscriptChunk(chunk_id=3, start_index=0, end_index=1, token_count=250, items=[{"role": "user", "content": "rename it"}])
 
         result = extractor.extract_chunk(chunk, {"repo": "coding-agent-router"})
@@ -42,7 +48,14 @@ class TestCompactionExtractor(unittest.TestCase):
         self.assertEqual(result.source_token_count, 250)
         self.assertEqual(result.files_touched, ["README.md"])
         self.assertEqual(client.calls[0]["response_format"], "json")
-        self.assertIsNotNone(client.calls[0]["max_tokens"])
+        self.assertEqual(client.calls[0]["max_tokens"], 2048)
+
+    def test_extract_chunk_response_budget_respects_remaining_context(self):
+        extractor = CompactionExtractor(client=_FakeClient("{}"), model="qwen-test", temperature=0.0, num_ctx=16384, max_output_tokens=2048)
+        self.assertEqual(extractor._response_token_budget(1000), 2048)
+        self.assertEqual(extractor._response_token_budget(14336), 1792)
+        self.assertEqual(extractor._response_token_budget(15000), 1128)
+        self.assertEqual(extractor._response_token_budget(17000), 0)
 
     def test_extract_chunk_rejects_non_json_output(self):
         extractor = CompactionExtractor(client=_FakeClient("not json"), model="qwen-test", temperature=0.0, num_ctx=12000)

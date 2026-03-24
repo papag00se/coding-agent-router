@@ -2,12 +2,11 @@
 
 ## Product Summary
 
-This repository implements a local-first AI gateway for coding workflows. It is not just a router. The current product is a combination of:
+This repository implements a local-first AI gateway for coding workflows. The current product is a combination of:
 
 - a FastAPI service that accepts multiple client API shapes
 - a routing layer that chooses between local coding, local reasoning, and optional Codex CLI execution
 - a transcript compaction pipeline that produces durable handoff state for long-running coding sessions
-- a Codex app-server bridge that persists thread state and can inject compacted context back into later turns
 - an optional compaction-only proxy service that locally handles inline compaction requests and proxies ordinary `/v1/responses` traffic upstream
 
 ## Operating Modes
@@ -24,7 +23,6 @@ Primary capabilities:
 - OpenAI-style `/v1/chat/completions`
 - OpenAI Responses `/v1/responses`
 - Ollama-style `/api/chat`
-- Codex app-server WebSocket bridge at `/app-server/ws`
 - internal transcript compaction endpoint at `/internal/compact`
 
 ### 2. Compaction Companion Service
@@ -35,7 +33,6 @@ Primary capabilities:
 
 - same health and discovery endpoints
 - same `/invoke` and `/internal/compact`
-- app-server bridge at `/app-server/ws`
 - `/v1/responses` as a split-mode endpoint:
   - inline compaction requests are served locally
   - non-compaction requests are proxied to `OPENAI_PASSTHROUGH_BASE_URL`
@@ -176,7 +173,7 @@ Additional persisted JSON artifacts:
 
 ### Prompt File Architecture
 
-The runtime now keeps application prompts out of Python source.
+The runtime keeps application prompts out of Python source.
 
 Implemented behavior:
 
@@ -184,26 +181,6 @@ Implemented behavior:
 - prompt files are loaded through [`app/prompt_loader.py`](/home/jesse/src/coding-agent-router/app/prompt_loader.py)
 - dynamic prompt templates use explicit placeholder replacement, for example `{{SYSTEM_SECTION}}` and `{{CURRENT_REQUEST}}`
 - unresolved placeholders raise an error instead of silently leaking template tokens into runtime prompts
-
-### App-Server Thread Bridge
-
-The app-server bridge in [`app/app_server.py`](/home/jesse/src/coding-agent-router/app/app_server.py) implements a JSON-RPC-like WebSocket interface for Codex app-server clients.
-
-Implemented methods:
-
-- `initialize`
-- `thread/start`
-- `turn/start`
-- `thread/compact/start`
-- `initialized`
-
-Implemented thread behavior:
-
-- creates persisted thread state on disk
-- keeps message history per thread
-- appends compacted memory into the system prompt after compaction
-- replaces older raw history with compacted `recent_raw_turns`
-- can force `preferred_backend=codex_cli` in compaction-only mode
 
 ### Inline Compaction Sentinel
 
@@ -220,7 +197,6 @@ Implemented rules:
 
 State is persisted under:
 
-- `state/app_server`
 - `state/compaction`
 
 Transport logging is appended to:
@@ -237,7 +213,6 @@ Operational helpers are included for:
 - smoke tests via [`scripts/smoke_test.py`](/home/jesse/src/coding-agent-router/scripts/smoke_test.py)
 - Anthropic gateway checks via [`scripts/anthropic_gateway_test.py`](/home/jesse/src/coding-agent-router/scripts/anthropic_gateway_test.py)
 - systemd unit generation via [`scripts/render_systemd_units.py`](/home/jesse/src/coding-agent-router/scripts/render_systemd_units.py)
-- proxying `codex app-server` traffic via [`scripts/codex_app_server_proxy.py`](/home/jesse/src/coding-agent-router/scripts/codex_app_server_proxy.py)
 
 ## Explicit Product Limits
 
@@ -255,7 +230,6 @@ The current implementation does not provide:
 
 These surfaces exist in code or config but are not meaningfully wired into the runtime today:
 
-- `APP_SERVER_MODE` exists in settings but runtime mode is chosen directly in code
 - `ENABLE_INCREMENTAL_COMPACTION` exists but is not consulted by compaction logic
 - `COMPACTOR_MERGE_BATCH_SIZE` exists but the merger does not batch
 - `DEFAULT_CLOUD_BACKEND` exists but routing hardcodes `codex_cli`

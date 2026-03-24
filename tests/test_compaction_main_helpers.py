@@ -68,6 +68,8 @@ class TestCompactionMainHelpers(unittest.TestCase):
             mock_settings.openai_passthrough_base_url = "https://example.test/base/"
             mock_settings.ollama_connect_timeout_seconds = 1
             mock_settings.codex_timeout_seconds = 2
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 0.2
 
             request = _DummyRequest(
                 {
@@ -107,6 +109,105 @@ class TestCompactionMainHelpers(unittest.TestCase):
             self.assertEqual(body, b"ab")
             stream.close.assert_called_once()
 
+    def test_spark_rewrite_classifier_covers_qualifying_shapes(self) -> None:
+        file_read_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {"type": "reasoning", "encrypted_content": "skip"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Command: /bin/bash -lc \"sed -n '1,220p' app/router.py\"\nOutput:\nfrom app import router\n",
+                },
+            ],
+        }
+        search_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_2",
+                    "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        test_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_3",
+                    "output": "Command: /bin/bash -lc '.venv/bin/python -m unittest tests.test_router_helpers'\nOutput:\nOK\n",
+                }
+            ],
+        }
+        polling_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_4",
+                    "output": "Command: /bin/bash -lc 'tail -n 40 -f state/compaction_transport.jsonl'\nProcess running with session ID 123\nOutput:\n",
+                }
+            ],
+        }
+        self.assertEqual(compaction_main._qualifying_spark_category(file_read_payload), "file_read")
+        self.assertEqual(compaction_main._qualifying_spark_category(search_payload), "search_inventory")
+        self.assertEqual(compaction_main._qualifying_spark_category(test_payload), "targeted_test")
+        self.assertEqual(compaction_main._qualifying_spark_category(polling_payload), "polling")
+
+    def test_spark_rewrite_respects_rate_and_context_limit(self) -> None:
+        payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        with patch.object(compaction_main, "settings", create=True) as mock_settings:
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_spark(payload)
+        self.assertEqual(rewritten["model"], "gpt-5.3-codex-spark")
+        self.assertTrue(rewrite["applied"])
+        huge_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {"type": "function_call_output", "call_id": "call_9", "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n" + ("a" * 500_000)}
+            ],
+        }
+        with patch.object(compaction_main, "settings", create=True) as mock_settings:
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_spark(huge_payload)
+        self.assertEqual(rewritten["model"], "gpt-5.4")
+        self.assertFalse(rewrite["applied"])
+
+    def test_spark_rewrite_uses_tokenizer_based_request_estimate(self) -> None:
+        payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_7",
+                    "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        with (
+            patch.object(compaction_main, "settings", create=True) as mock_settings,
+            patch.object(compaction_main, "estimate_openai_tokens", return_value=99_999) as estimate_openai_tokens,
+        ):
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_spark(payload)
+        estimate_openai_tokens.assert_called_once_with(payload, model="gpt-5.4")
+        self.assertEqual(rewritten["model"], "gpt-5.3-codex-spark")
+        self.assertEqual(rewrite["request_tokens"], 99_999)
+
     def test_direct_endpoint_helpers_cover_health_and_simple_wrappers(self) -> None:
         class DummyService:
             def invoke(self, req):
@@ -120,7 +221,7 @@ class TestCompactionMainHelpers(unittest.TestCase):
             mock_settings.coder_model = "coder"
             mock_settings.reasoner_model = "reasoner"
             mock_settings.enable_codex_cli = True
-            self.assertEqual(compaction_main.health()["app_server_mode"], "compaction_only")
+            self.assertTrue(compaction_main.health()["ok"])
             self.assertEqual(compaction_main.ollama_version()["version"], "0.0.0-router")
             self.assertEqual(compaction_main.ollama_tags()["models"][0]["name"], "router")
             self.assertEqual(compaction_main.openai_models()["object"], "list")
@@ -139,17 +240,3 @@ class TestCompactionMainHelpers(unittest.TestCase):
                 )()
             )
             self.assertEqual(compact_response.body, b'{"ok":true}')
-
-    def test_websocket_wrapper_delegates_to_app_server(self) -> None:
-        class DummyAppServer:
-            def __init__(self):
-                self.websocket = None
-
-            async def handle_websocket(self, websocket):
-                self.websocket = websocket
-
-        dummy = DummyAppServer()
-        websocket = object()
-        with patch.object(compaction_main, "app_server", dummy):
-            asyncio.run(compaction_main.codex_app_server(websocket))
-        self.assertIs(dummy.websocket, websocket)

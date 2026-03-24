@@ -51,6 +51,23 @@ class MergedState(BaseModel):
     merged_chunk_count: int = 0
 
 
+class MergedStatePatch(BaseModel):
+    objective_update: str = ""
+    repo_state_updates: Dict[str, Any] = Field(default_factory=dict)
+    add_files_touched: List[str] = Field(default_factory=list)
+    add_commands_run: List[str] = Field(default_factory=list)
+    add_errors: List[str] = Field(default_factory=list)
+    add_accepted_fixes: List[str] = Field(default_factory=list)
+    add_rejected_ideas: List[str] = Field(default_factory=list)
+    add_constraints: List[str] = Field(default_factory=list)
+    add_environment_assumptions: List[str] = Field(default_factory=list)
+    add_pending_todos: List[str] = Field(default_factory=list)
+    add_unresolved_bugs: List[str] = Field(default_factory=list)
+    add_test_status: List[str] = Field(default_factory=list)
+    add_external_references: List[str] = Field(default_factory=list)
+    latest_plan_update: List[str] = Field(default_factory=list)
+
+
 class DurableMemorySet(BaseModel):
     task_state: str = ""
     decisions: str = ""
