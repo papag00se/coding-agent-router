@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from app.compaction.extractor import CompactionExtractor
 from app.compaction.models import TranscriptChunk
@@ -12,7 +13,7 @@ class _FakeClient:
         self.content = content
         self.calls = []
 
-    def chat(self, model, messages, *, temperature, num_ctx, max_tokens=None, system=None, response_format=None, tools=None):
+    def chat(self, model, messages, *, temperature, num_ctx, max_tokens=None, system=None, response_format=None, think=None, tools=None):
         self.calls.append(
             {
                 "model": model,
@@ -22,6 +23,7 @@ class _FakeClient:
                 "max_tokens": max_tokens,
                 "system": system,
                 "response_format": response_format,
+                "think": think,
                 "tools": tools,
             }
         )
@@ -38,7 +40,6 @@ class TestCompactionExtractor(unittest.TestCase):
             model="qwen-test",
             temperature=0.0,
             num_ctx=12000,
-            max_output_tokens=2048,
         )
         chunk = TranscriptChunk(chunk_id=3, start_index=0, end_index=1, token_count=250, items=[{"role": "user", "content": "rename it"}])
 
@@ -48,14 +49,29 @@ class TestCompactionExtractor(unittest.TestCase):
         self.assertEqual(result.source_token_count, 250)
         self.assertEqual(result.files_touched, ["README.md"])
         self.assertEqual(client.calls[0]["response_format"], "json")
-        self.assertEqual(client.calls[0]["max_tokens"], 2048)
+        self.assertFalse(client.calls[0]["think"])
+        self.assertEqual(client.calls[0]["max_tokens"], 10895)
 
     def test_extract_chunk_response_budget_respects_remaining_context(self):
-        extractor = CompactionExtractor(client=_FakeClient("{}"), model="qwen-test", temperature=0.0, num_ctx=16384, max_output_tokens=2048)
-        self.assertEqual(extractor._response_token_budget(1000), 2048)
+        extractor = CompactionExtractor(client=_FakeClient("{}"), model="qwen-test", temperature=0.0, num_ctx=16384)
+        self.assertEqual(extractor._response_token_budget(1000), 15128)
         self.assertEqual(extractor._response_token_budget(14336), 1792)
         self.assertEqual(extractor._response_token_budget(15000), 1128)
         self.assertEqual(extractor._response_token_budget(17000), 0)
+
+    def test_extract_chunk_uses_burst_context_when_default_window_would_starve_output(self):
+        client = _FakeClient('{"objective":"ok"}')
+        extractor = CompactionExtractor(client=client, model="qwen-test", temperature=0.0, num_ctx=16384)
+        chunk = TranscriptChunk(chunk_id=9, start_index=0, end_index=1, token_count=10, items=[{"role": "user", "content": "small"}])
+
+        with mock.patch(
+            "app.compaction.extractor.estimate_extraction_request_tokens",
+            return_value=16000,
+        ):
+            extractor.extract_chunk(chunk)
+
+        self.assertEqual(client.calls[0]["num_ctx"], 17408)
+        self.assertEqual(client.calls[0]["max_tokens"], 1152)
 
     def test_extract_chunk_rejects_non_json_output(self):
         extractor = CompactionExtractor(client=_FakeClient("not json"), model="qwen-test", temperature=0.0, num_ctx=12000)

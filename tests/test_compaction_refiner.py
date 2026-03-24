@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from app.compaction.models import MergedState
 from app.compaction.prompts import REFINEMENT_SYSTEM_PROMPT, build_refinement_payload
@@ -12,7 +13,7 @@ class _FakeClient:
         self.content = content
         self.calls = []
 
-    def chat(self, model, messages, *, temperature, num_ctx, max_tokens=None, system=None, response_format=None, tools=None):
+    def chat(self, model, messages, *, temperature, num_ctx, max_tokens=None, system=None, response_format=None, think=None, tools=None):
         self.calls.append(
             {
                 "model": model,
@@ -22,6 +23,7 @@ class _FakeClient:
                 "max_tokens": max_tokens,
                 "system": system,
                 "response_format": response_format,
+                "think": think,
                 "tools": tools,
             }
         )
@@ -36,7 +38,6 @@ class TestCompactionRefiner(unittest.TestCase):
             model="qwen-test",
             temperature=0.0,
             num_ctx=12000,
-            max_output_tokens=2048,
         )
         state = MergedState(objective="old objective", merged_chunk_count=4)
 
@@ -51,14 +52,28 @@ class TestCompactionRefiner(unittest.TestCase):
         self.assertEqual(result.latest_plan, ["step 1"])
         self.assertEqual(result.merged_chunk_count, 4)
         self.assertEqual(client.calls[0]["response_format"], "json")
-        self.assertEqual(client.calls[0]["max_tokens"], 2048)
+        self.assertFalse(client.calls[0]["think"])
+        self.assertEqual(client.calls[0]["max_tokens"], 11003)
 
     def test_refine_state_response_budget_respects_remaining_context(self):
-        refiner = CompactionRefiner(client=_FakeClient("{}"), model="qwen-test", temperature=0.0, num_ctx=16384, max_output_tokens=2048)
-        self.assertEqual(refiner._response_token_budget(1000), 2048)
+        refiner = CompactionRefiner(client=_FakeClient("{}"), model="qwen-test", temperature=0.0, num_ctx=16384)
+        self.assertEqual(refiner._response_token_budget(1000), 15128)
         self.assertEqual(refiner._response_token_budget(14336), 1792)
         self.assertEqual(refiner._response_token_budget(15000), 1128)
         self.assertEqual(refiner._response_token_budget(17000), 0)
+
+    def test_refine_state_uses_burst_context_when_default_window_would_starve_output(self):
+        client = _FakeClient('{"objective_update":"ok"}')
+        refiner = CompactionRefiner(client=client, model="qwen-test", temperature=0.0, num_ctx=16384)
+
+        with mock.patch(
+            "app.compaction.refiner.estimate_refinement_request_tokens",
+            return_value=16000,
+        ):
+            refiner.refine_state(MergedState(), [{"role": "user", "content": "x"}], current_request="x")
+
+        self.assertEqual(client.calls[0]["num_ctx"], 17408)
+        self.assertEqual(client.calls[0]["max_tokens"], 1152)
 
     def test_refine_state_normalizes_structured_fields(self):
         client = _FakeClient(

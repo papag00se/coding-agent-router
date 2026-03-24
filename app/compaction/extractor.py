@@ -24,7 +24,6 @@ class CompactionExtractor:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         num_ctx: Optional[int] = None,
-        max_output_tokens: Optional[int] = None,
     ) -> None:
         self.client = client or OllamaClient(
             settings.compactor_ollama_base_url,
@@ -35,27 +34,26 @@ class CompactionExtractor:
         self.model = model or settings.compactor_model
         self.temperature = settings.compactor_temperature if temperature is None else temperature
         self.num_ctx = settings.compactor_num_ctx if num_ctx is None else num_ctx
-        self.max_output_tokens = (
-            settings.compactor_response_headroom_tokens if max_output_tokens is None else max_output_tokens
-        )
-        self.minimum_response_tokens = min(self.max_output_tokens, _MIN_EXTRACTION_RESPONSE_TOKENS)
+        self.burst_num_ctx = max(self.num_ctx, settings.compactor_burst_num_ctx)
+        self.minimum_response_tokens = _MIN_EXTRACTION_RESPONSE_TOKENS
         self.token_estimation_slack = _TOKEN_ESTIMATION_SLACK
 
     def extract_chunk(self, chunk: TranscriptChunk, repo_context: Optional[Dict[str, Any]] = None) -> ChunkExtraction:
         payload = build_extraction_payload(chunk, repo_context)
         prompt_tokens = estimate_extraction_request_tokens(chunk, repo_context, model=self.model)
-        response_token_budget = self._response_token_budget(prompt_tokens)
+        request_num_ctx, response_token_budget = self._request_budget(prompt_tokens)
         if response_token_budget < self.minimum_response_tokens:
             raise ValueError(
                 f"insufficient compaction extractor output budget: prompt_tokens={prompt_tokens} "
                 f"available={response_token_budget} minimum={self.minimum_response_tokens}"
             )
         logger.warning(
-            "compaction_llm_request stage=extract chunk_id=%s model=%s prompt_tokens=%s response_tokens=%s chunk_tokens=%s item_count=%s",
+            "compaction_llm_request stage=extract chunk_id=%s model=%s prompt_tokens=%s response_tokens=%s num_ctx=%s chunk_tokens=%s item_count=%s",
             chunk.chunk_id,
             self.model,
             prompt_tokens,
             response_token_budget,
+            request_num_ctx,
             chunk.token_count,
             len(chunk.items),
         )
@@ -64,10 +62,11 @@ class CompactionExtractor:
             self.model,
             [{"role": "user", "content": payload}],
             temperature=self.temperature,
-            num_ctx=self.num_ctx,
+            num_ctx=request_num_ctx,
             max_tokens=response_token_budget,
             system=EXTRACTION_SYSTEM_PROMPT,
             response_format="json",
+            think=False,
         )
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         logger.warning(
@@ -91,8 +90,22 @@ class CompactionExtractor:
         parsed.setdefault("source_token_count", chunk.token_count)
         return ChunkExtraction.model_validate(parsed)
 
+    def target_prompt_tokens(self) -> int:
+        return max(1, self.num_ctx - self.minimum_response_tokens - self.token_estimation_slack)
+
+    def max_prompt_tokens(self) -> int:
+        return max(1, self.burst_num_ctx - self.minimum_response_tokens - self.token_estimation_slack)
+
     def _response_token_budget(self, prompt_tokens: int) -> int:
-        available = self.num_ctx - prompt_tokens - self.token_estimation_slack
+        return self._request_budget(prompt_tokens)[1]
+
+    def _request_budget(self, prompt_tokens: int) -> tuple[int, int]:
+        default_available = self.num_ctx - prompt_tokens - self.token_estimation_slack
+        if default_available >= self.minimum_response_tokens:
+            return self.num_ctx, default_available
+
+        request_num_ctx = self.burst_num_ctx
+        available = request_num_ctx - prompt_tokens - self.token_estimation_slack
         if available < self.minimum_response_tokens:
-            return 0
-        return min(self.max_output_tokens, available)
+            return request_num_ctx, 0
+        return request_num_ctx, available

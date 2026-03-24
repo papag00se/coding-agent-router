@@ -31,7 +31,7 @@ service = RoutingService()
 inline_compaction_jobs = InlineCompactionJobManager(service)
 _TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
 _UPSTREAM = requests.Session()
-_SPARK_MAX_REQUEST_TOKENS = 100_000
+_SPARK_MAX_REQUEST_TOKENS = 114_688
 _SHELL_WRAPPER = re.compile(r"^(?:/bin/)?bash\s+-lc\s+(['\"])(?P<inner>.*)\1$", re.DOTALL)
 
 
@@ -135,7 +135,7 @@ def _rewrite_passthrough_payload_for_spark(payload: Dict[str, Any]) -> tuple[Dic
     category = _qualifying_spark_category(payload)
     eligible = (
         payload.get('model') == 'gpt-5.4'
-        and request_tokens < _SPARK_MAX_REQUEST_TOKENS
+        and request_tokens <= _SPARK_MAX_REQUEST_TOKENS
         and category is not None
     )
     sample_value = _stable_sample_value(payload)
@@ -417,4 +417,3 @@ async def openai_responses(request: Request):
 @app.post("/api/chat")
 def ollama_chat(_: Dict[str, Any]):
     return _unsupported_transport_response('ollama_chat')
-

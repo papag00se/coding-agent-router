@@ -15,6 +15,8 @@ from .prompts import estimate_extraction_request_tokens, estimate_refinement_req
 from .refiner import CompactionRefiner
 from .storage import CompactionStorage
 
+_REFINEMENT_RECENT_RAW_TARGET_TOKENS = 8000
+
 
 class CompactionService:
     def __init__(
@@ -45,18 +47,8 @@ class CompactionService:
         )
         compactable, recent_raw_turns = split_recent_raw_turns(normalized.compactable_items, settings.compactor_keep_raw_tokens)
         recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, normalized.preserved_tail)
-        target_prompt_tokens = max(
-            1,
-            settings.compactor_num_ctx
-            - settings.compactor_response_headroom_tokens
-            - getattr(self.extractor, "token_estimation_slack", 0),
-        )
-        max_prompt_tokens = max(
-            1,
-            settings.compactor_num_ctx
-            - getattr(self.extractor, "minimum_response_tokens", settings.compactor_response_headroom_tokens)
-            - getattr(self.extractor, "token_estimation_slack", 0),
-        )
+        target_prompt_tokens = self.extractor.target_prompt_tokens()
+        max_prompt_tokens = self.extractor.max_prompt_tokens()
         chunks, skipped_items = chunk_transcript_items_by_prompt(
             compactable,
             target_prompt_tokens=min(settings.compactor_target_chunk_tokens, target_prompt_tokens, max_prompt_tokens),
@@ -164,11 +156,13 @@ class CompactionService:
         iteration = 0
         max_prompt_tokens = self._refinement_max_prompt_tokens()
         target_prompt_tokens = self._refinement_target_prompt_tokens(max_prompt_tokens)
+        target_recent_raw_tokens = self._refinement_target_recent_raw_tokens()
         total_iterations = self._estimate_refinement_iterations(
             remaining,
             merged,
             target_prompt_tokens=target_prompt_tokens,
             max_prompt_tokens=max_prompt_tokens,
+            target_recent_raw_tokens=target_recent_raw_tokens,
             current_request=current_request,
             repo_context=repo_context,
         )
@@ -193,6 +187,8 @@ class CompactionService:
                 remaining,
                 target_prompt_tokens=target_prompt_tokens,
                 max_prompt_tokens=max_prompt_tokens,
+                target_item_tokens=target_recent_raw_tokens,
+                item_token_counter=estimate_tokens,
                 prompt_token_counter=lambda candidate_items: estimate_refinement_request_tokens(
                     state,
                     candidate_items,
@@ -236,23 +232,13 @@ class CompactionService:
         return state
 
     def _refinement_max_prompt_tokens(self) -> int:
-        return max(
-            1,
-            settings.compactor_num_ctx
-            - getattr(self.refiner, "minimum_response_tokens", settings.compactor_response_headroom_tokens)
-            - getattr(self.refiner, "token_estimation_slack", 0),
-        )
+        return self.refiner.max_prompt_tokens()
 
     def _refinement_target_prompt_tokens(self, max_prompt_tokens: int) -> int:
-        return max(
-            1,
-            min(
-                max_prompt_tokens,
-                settings.compactor_num_ctx
-                - settings.compactor_response_headroom_tokens
-                - getattr(self.refiner, "token_estimation_slack", 0),
-            ),
-        )
+        return max(1, min(max_prompt_tokens, self.refiner.target_prompt_tokens()))
+
+    def _refinement_target_recent_raw_tokens(self) -> int:
+        return _REFINEMENT_RECENT_RAW_TARGET_TOKENS
 
     def _estimate_refinement_iterations(
         self,
@@ -261,6 +247,7 @@ class CompactionService:
         *,
         target_prompt_tokens: int,
         max_prompt_tokens: int,
+        target_recent_raw_tokens: int,
         current_request: str,
         repo_context: Optional[Dict[str, Any]] = None,
     ) -> int:
@@ -280,6 +267,8 @@ class CompactionService:
                 remaining,
                 target_prompt_tokens=target_prompt_tokens,
                 max_prompt_tokens=max_prompt_tokens,
+                target_item_tokens=target_recent_raw_tokens,
+                item_token_counter=estimate_tokens,
                 prompt_token_counter=lambda candidate_items: estimate_refinement_request_tokens(
                     state,
                     candidate_items,
@@ -311,16 +300,28 @@ def _take_items_with_prompt_budget(
     *,
     target_prompt_tokens: int,
     max_prompt_tokens: int,
+    target_item_tokens: Optional[int] = None,
+    item_token_counter: Optional[Callable[[List[Dict[str, Any]]], int]] = None,
     prompt_token_counter: Callable[[List[Dict[str, Any]]], int],
 ) -> tuple[List[Dict[str, Any]], int, bool]:
     best_end = 0
     for end in range(len(items)):
         candidate_items = items[: end + 1]
+        if target_item_tokens is not None and item_token_counter is not None:
+            item_tokens = item_token_counter(candidate_items)
+            if item_tokens > target_item_tokens and end > 0:
+                break
         prompt_tokens = prompt_token_counter(candidate_items)
         if prompt_tokens > max_prompt_tokens:
             break
         best_end = end + 1
         if prompt_tokens >= target_prompt_tokens:
+            break
+        if (
+            target_item_tokens is not None
+            and item_token_counter is not None
+            and item_tokens >= target_item_tokens
+        ):
             break
     if best_end == 0:
         return [], 1 if items else 0, bool(items)

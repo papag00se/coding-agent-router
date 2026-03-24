@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.compaction.models import ChunkExtraction
+from app.compaction import service as compaction_service_module
 from app.compaction.service import CompactionService
 from app.compaction.storage import CompactionStorage
 from app.task_metrics import estimate_tokens
@@ -17,6 +18,8 @@ FIXTURE_PATH = Path(__file__).parent / "fixtures" / "codex_support_transcript_la
 class _FakeExtractor:
     def __init__(self) -> None:
         self.model = "qwen-test"
+        self.token_estimation_slack = 256
+        self.minimum_response_tokens = 1024
         self.calls = []
 
     def extract_chunk(self, chunk, repo_context=None):
@@ -31,10 +34,21 @@ class _FakeExtractor:
             source_token_count=chunk.token_count,
         )
 
+    def target_prompt_tokens(self) -> int:
+        base_ctx = compaction_service_module.settings.compactor_num_ctx
+        return max(1, base_ctx - self.minimum_response_tokens - self.token_estimation_slack)
+
+    def max_prompt_tokens(self) -> int:
+        base_ctx = compaction_service_module.settings.compactor_num_ctx
+        burst_ctx = getattr(compaction_service_module.settings, "compactor_burst_num_ctx", base_ctx)
+        return max(1, burst_ctx - self.minimum_response_tokens - self.token_estimation_slack)
+
 
 class _FakeRefiner:
     def __init__(self) -> None:
         self.model = "qwen-test"
+        self.token_estimation_slack = 256
+        self.minimum_response_tokens = 512
         self.calls = []
 
     def refine_state(self, state, recent_raw_turns, *, current_request, repo_context=None):
@@ -50,6 +64,15 @@ class _FakeRefiner:
             state.objective = state.objective or current_request
             state.latest_plan = [current_request]
         return state
+
+    def target_prompt_tokens(self) -> int:
+        base_ctx = compaction_service_module.settings.compactor_num_ctx
+        return max(1, base_ctx - self.minimum_response_tokens - self.token_estimation_slack)
+
+    def max_prompt_tokens(self) -> int:
+        base_ctx = compaction_service_module.settings.compactor_num_ctx
+        burst_ctx = getattr(compaction_service_module.settings, "compactor_burst_num_ctx", base_ctx)
+        return max(1, burst_ctx - self.minimum_response_tokens - self.token_estimation_slack)
 
 
 class TestCompactionService(unittest.TestCase):
@@ -67,11 +90,10 @@ class TestCompactionService(unittest.TestCase):
                 "app.compaction.service.settings",
                 SimpleNamespace(
                     compactor_keep_raw_tokens=500,
-                    compactor_target_chunk_tokens=1200,
+                    compactor_target_chunk_tokens=1600,
                     compactor_max_chunk_tokens=1600,
                     compactor_overlap_tokens=200,
                     compactor_num_ctx=4000,
-                    compactor_response_headroom_tokens=512,
                 ),
             ):
                 handoff = service.compact_transcript(
@@ -99,11 +121,10 @@ class TestCompactionService(unittest.TestCase):
                 "app.compaction.service.settings",
                 SimpleNamespace(
                     compactor_keep_raw_tokens=500,
-                    compactor_target_chunk_tokens=1200,
+                    compactor_target_chunk_tokens=1600,
                     compactor_max_chunk_tokens=1600,
                     compactor_overlap_tokens=200,
                     compactor_num_ctx=4000,
-                    compactor_response_headroom_tokens=512,
                 ),
             ):
                 service.compact_transcript(
@@ -198,11 +219,15 @@ class TestCompactionService(unittest.TestCase):
                 "app.compaction.service.settings",
                 SimpleNamespace(
                     compactor_keep_raw_tokens=4000,
-                    compactor_target_chunk_tokens=300,
+                    compactor_target_chunk_tokens=900,
                     compactor_max_chunk_tokens=600,
                     compactor_overlap_tokens=0,
-                    compactor_num_ctx=1200,
-                    compactor_response_headroom_tokens=128,
+                    compactor_num_ctx=1800,
+                ),
+            ), patch(
+                "app.compaction.service.estimate_refinement_request_tokens",
+                side_effect=lambda state, recent_raw_turns, current_request, repo_context=None, model=None: (
+                    1100 if len(recent_raw_turns) >= 2 else 700
                 ),
             ):
                 handoff = service.compact_transcript(
@@ -231,8 +256,7 @@ class TestCompactionService(unittest.TestCase):
                     compactor_target_chunk_tokens=1200,
                     compactor_max_chunk_tokens=1600,
                     compactor_overlap_tokens=0,
-                    compactor_num_ctx=2000,
-                    compactor_response_headroom_tokens=256,
+                    compactor_num_ctx=2200,
                 ),
             ), patch(
                 "app.compaction.service.estimate_extraction_request_tokens",
@@ -266,7 +290,6 @@ class TestCompactionService(unittest.TestCase):
                     compactor_max_chunk_tokens=1600,
                     compactor_overlap_tokens=0,
                     compactor_num_ctx=2000,
-                    compactor_response_headroom_tokens=512,
                 ),
             ), patch(
                 "app.compaction.service.estimate_refinement_request_tokens",
@@ -286,8 +309,44 @@ class TestCompactionService(unittest.TestCase):
                 )
 
         self.assertEqual(len(refiner.calls), 1)
-        self.assertEqual(
-            [item["content"] for item in refiner.calls[0]["recent_raw_turns"]],
-            ["small raw turn", "latest raw"],
-        )
+        recent_contents = [item["content"] for item in refiner.calls[0]["recent_raw_turns"]]
+        self.assertIn("small raw turn", recent_contents)
+        self.assertIn("latest raw", recent_contents)
+        self.assertNotIn("oversize raw turn", recent_contents)
         self.assertIn({"role": "assistant", "content": "oversize raw turn"}, handoff.recent_raw_turns)
+
+    def test_compact_transcript_caps_each_refinement_iteration_at_8000_recent_raw_tokens(self):
+        extractor = _FakeExtractor()
+        refiner = _FakeRefiner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = CompactionService(extractor=extractor, refiner=refiner, storage=CompactionStorage(Path(tmpdir)))
+            with patch(
+                "app.compaction.service.settings",
+                SimpleNamespace(
+                    compactor_keep_raw_tokens=20000,
+                    compactor_target_chunk_tokens=1200,
+                    compactor_max_chunk_tokens=1600,
+                    compactor_overlap_tokens=0,
+                    compactor_num_ctx=16000,
+                ),
+            ), patch(
+                "app.compaction.service.estimate_refinement_request_tokens",
+                return_value=700,
+            ):
+                handoff = service.compact_transcript(
+                    "session-refine-cap",
+                    [
+                        {"role": "user", "content": "raw-one " + ("a" * 6000)},
+                        {"role": "assistant", "content": "raw-two " + ("b" * 6000)},
+                        {"role": "user", "content": "raw-three " + ("c" * 6000)},
+                        {"role": "assistant", "content": "raw-four " + ("d" * 6000)},
+                        {"role": "user", "content": "raw-five " + ("e" * 6000)},
+                        {"role": "assistant", "content": "latest raw preserved " + ("f" * 6000)},
+                    ],
+                    current_request="continue",
+                )
+
+        self.assertGreaterEqual(len(refiner.calls), 2)
+        self.assertEqual(handoff.recent_raw_turns[-1]["role"], "assistant")
+        for call in refiner.calls:
+            self.assertLessEqual(estimate_tokens(call["recent_raw_turns"]), 8000)

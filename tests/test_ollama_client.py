@@ -57,6 +57,7 @@ class TestOllamaClient(unittest.TestCase):
             max_tokens=256,
             system="sys",
             response_format="json",
+            think=False,
             tools=[{"type": "function"}],
         )
 
@@ -65,6 +66,7 @@ class TestOllamaClient(unittest.TestCase):
         self.assertEqual(fake_session.calls[0]["url"], "http://127.0.0.1:11434/api/chat")
         self.assertEqual(payload["messages"][0], {"role": "system", "content": "sys"})
         self.assertEqual(payload["format"], "json")
+        self.assertFalse(payload["think"])
         self.assertEqual(payload["tools"], [{"type": "function"}])
         self.assertEqual(payload["options"]["num_predict"], 256)
         self.assertFalse(payload["stream"])
@@ -116,6 +118,7 @@ class TestOllamaClient(unittest.TestCase):
                 max_tokens=64,
                 system="sys",
                 response_format="json",
+                think=False,
                 tools=[{"type": "function"}],
             )
         )
@@ -123,5 +126,6 @@ class TestOllamaClient(unittest.TestCase):
         payload = fake_session.calls[0]["json"]
         self.assertEqual(payload["messages"][0], {"role": "system", "content": "sys"})
         self.assertEqual(payload["format"], "json")
+        self.assertFalse(payload["think"])
         self.assertEqual(payload["tools"], [{"type": "function"}])
         self.assertEqual(payload["options"]["num_predict"], 64)

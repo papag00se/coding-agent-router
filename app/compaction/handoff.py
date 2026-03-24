@@ -8,15 +8,16 @@ from .models import CodexHandoffFlow, DurableMemorySet, SessionHandoff
 
 
 def build_codex_handoff_flow(memory: DurableMemorySet, handoff: SessionHandoff, *, current_request: str | None = None) -> CodexHandoffFlow:
+    session_handoff = _strip_current_request_section(memory.session_handoff)
     return CodexHandoffFlow(
         durable_memory=[
             {"name": "TASK_STATE.md", "content": memory.task_state},
             {"name": "DECISIONS.md", "content": memory.decisions},
             {"name": "FAILURES_TO_AVOID.md", "content": memory.failures_to_avoid},
             {"name": "NEXT_STEPS.md", "content": memory.next_steps},
-            {"name": "SESSION_HANDOFF.md", "content": memory.session_handoff},
+            {"name": "SESSION_HANDOFF.md", "content": session_handoff},
         ],
-        structured_handoff=handoff.model_dump(),
+        structured_handoff=handoff.model_dump(exclude={"recent_raw_turns", "current_request"}),
         recent_raw_turns=handoff.recent_raw_turns,
         current_request=current_request if current_request is not None else handoff.current_request,
     )
@@ -41,6 +42,23 @@ def render_compacted_flow(flow: CodexHandoffFlow | Dict[str, Any], *, current_re
     )
 
 
+def render_inline_compaction_summary(flow: CodexHandoffFlow | Dict[str, Any], *, current_request: str = "") -> str:
+    if isinstance(flow, CodexHandoffFlow):
+        payload = flow.model_dump()
+    else:
+        payload = flow
+
+    sections = [
+        item["content"].rstrip()
+        for item in payload.get("durable_memory") or []
+        if isinstance(item, dict) and isinstance(item.get("content"), str) and item["content"].strip()
+    ]
+    request_text = current_request or payload.get("current_request") or ""
+    if request_text:
+        sections.append(f"# Current Request\n{request_text}".rstrip())
+    return "\n\n".join(section for section in sections if section).strip()
+
+
 def render_codex_support_prompt(flow: CodexHandoffFlow, *, system: str = "", current_request: str = "") -> str:
     request_text = current_request or flow.current_request
     durable_memory_blocks = "\n\n".join(
@@ -56,3 +74,23 @@ def render_codex_support_prompt(flow: CodexHandoffFlow, *, system: str = "", cur
             'CURRENT_REQUEST': request_text,
         },
     )
+
+
+def _strip_current_request_section(content: str) -> str:
+    if "## Current Request" not in content:
+        return content
+
+    lines = content.splitlines()
+    filtered: list[str] = []
+    skipping = False
+    for line in lines:
+        if line == "## Current Request":
+            skipping = True
+            continue
+        if skipping and line.startswith("## "):
+            skipping = False
+        if not skipping:
+            filtered.append(line)
+
+    normalized = "\n".join(filtered).rstrip()
+    return normalized + "\n" if normalized else ""

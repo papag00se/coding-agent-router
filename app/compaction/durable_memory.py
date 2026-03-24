@@ -38,7 +38,6 @@ def render_durable_memory(state: MergedState, recent_raw_turns: List[Dict[str, A
             [
                 ("Stable Task Definition", [handoff.stable_task_definition] if handoff.stable_task_definition else []),
                 ("Unresolved Work", handoff.unresolved_work),
-                ("Current Request", [current_request] if current_request else []),
             ],
         ),
     )

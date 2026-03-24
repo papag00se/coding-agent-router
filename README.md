@@ -63,4 +63,4 @@ The Ollama clients also use keep-alive HTTP pools. Tune with:
 - `OLLAMA_POOL_CONNECTIONS`
 - `OLLAMA_POOL_MAXSIZE`
 
-See `docs/INSTALL.md` first.
+See [the docs index](/home/jesse/src/coding-agent-router/docs/index.md) first, then start with [installation](/home/jesse/src/coding-agent-router/docs/product/installation.md).

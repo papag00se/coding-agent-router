@@ -196,9 +196,12 @@ class TestRouterHelpers(unittest.TestCase):
                 }
             )
             inline = service.invoke_inline_compact_from_anthropic(req)
-            self.assertIn("TASK_STATE.md", inline["content"][0]["text"])
+            self.assertIn("# Task State", inline["content"][0]["text"])
             self.assertIn("Fix the hydration mismatch in the header.", inline["content"][0]["text"])
             self.assertNotIn("Summarize the thread for continuation.", inline["content"][0]["text"])
+            self.assertNotIn("Structured handoff:", inline["content"][0]["text"])
+            self.assertNotIn("Recent raw turns:", inline["content"][0]["text"])
+            self.assertIn("Structured handoff:", inline["raw_backend"]["machine_compacted_flow"])
             self.assertEqual(inline["raw_backend"]["current_request"], "Fix the hydration mismatch in the header.")
             self.assertGreater(inline["usage"]["input_tokens"], 0)
             self.assertEqual(service.compaction_service.compact_calls[-1][0][0], "thread-1")
@@ -212,7 +215,7 @@ class TestRouterHelpers(unittest.TestCase):
 
             streamed = list(service.stream_inline_compact_from_anthropic(req))
             self.assertEqual([event["type"] for event in streamed], ["text_delta", "final"])
-            self.assertIn("TASK_STATE.md", streamed[-1]["response"]["content"][0]["text"])
+            self.assertIn("# Task State", streamed[-1]["response"]["content"][0]["text"])
 
     def test_inline_compaction_inputs_preserve_structured_tool_output_turns(self) -> None:
         with patch.object(router, "settings", create=True) as mock_settings:

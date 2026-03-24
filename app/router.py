@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .clients.codex_client import CodexCLIClient
 from .clients.ollama_client import OllamaClient
-from .compaction import CompactionService, render_codex_support_prompt, render_compacted_flow
+from .compaction import CompactionService, render_codex_support_prompt, render_compacted_flow, render_inline_compaction_summary
 from .config import settings
 from .models import AnthropicMessagesRequest, InvokeRequest, InvokeResponse, RouteDecision
 from .prompt_loader import load_prompt
@@ -205,6 +205,7 @@ class RoutingService:
             num_ctx=settings.router_num_ctx,
             system=_load_router_system(),
             response_format='json',
+            think=False,
         )
         content = raw.get('message', {}).get('content', '')
         try:
@@ -341,7 +342,7 @@ class RoutingService:
         flow = self.build_compaction_handoff_flow(session_id, current_request=current_request)
         if flow is None:
             raise RuntimeError(f'Inline compaction failed to build compacted flow for session {session_id}')
-        rendered = render_compacted_flow(flow, current_request=current_request)
+        rendered = render_inline_compaction_summary(flow, current_request=current_request)
         if progress_callback is not None:
             progress_callback('inline_render_completed', session_id=session_id)
         raw_backend = {
@@ -350,6 +351,7 @@ class RoutingService:
             'current_request': current_request,
             'handoff': handoff,
             'compacted_flow': flow,
+            'machine_compacted_flow': render_compacted_flow(flow, current_request=current_request),
             'usage': {
                 'input_tokens': estimate_tokens(transcript_items),
                 'output_tokens': estimate_tokens(rendered),

@@ -18,6 +18,8 @@ FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "codex_support_tra
 class _FakeExtractor:
     def __init__(self) -> None:
         self.calls = []
+        self.model = "qwen-test"
+        self.token_estimation_slack = 256
 
     def extract_chunk(self, chunk, repo_context=None):
         self.calls.append((chunk, repo_context))
@@ -42,12 +44,28 @@ class _FakeExtractor:
             source_token_count=chunk.token_count,
         )
 
+    def target_prompt_tokens(self) -> int:
+        return 9000
+
+    def max_prompt_tokens(self) -> int:
+        return 11000
+
 
 class _FakeRefiner:
+    def __init__(self) -> None:
+        self.model = "qwen-test"
+        self.token_estimation_slack = 256
+
     def refine_state(self, state, recent_raw_turns, *, current_request, repo_context=None):
         if recent_raw_turns and not state.latest_plan:
             state.latest_plan = [current_request]
         return state
+
+    def target_prompt_tokens(self) -> int:
+        return 9000
+
+    def max_prompt_tokens(self) -> int:
+        return 11000
 
 
 class TestHandoffFlow(unittest.TestCase):
@@ -65,7 +83,6 @@ class TestHandoffFlow(unittest.TestCase):
                     compactor_max_chunk_tokens=8000,
                     compactor_overlap_tokens=500,
                     compactor_num_ctx=12000,
-                    compactor_response_headroom_tokens=1024,
                 ),
             ):
                 service.compact_transcript(
@@ -95,3 +112,34 @@ class TestHandoffFlow(unittest.TestCase):
         self.assertEqual(flow.current_request, "Finish the remaining rename and rerun the search.")
         self.assertEqual(flow.recent_raw_turns[-1]["content"], "Update app/main.py and tests/test_tool_adapter.py, then rerun the search.")
         self.assertIn("tool-call leak collapsed into assistant text", flow.structured_handoff["failures_to_avoid"])
+
+    def test_built_handoff_flow_excludes_ephemeral_fields_from_stored_state(self):
+        extractor = _FakeExtractor()
+        class _NoopRefiner(_FakeRefiner):
+            def refine_state(self, state, recent_raw_turns, *, current_request, repo_context=None):
+                return state
+
+        refiner = _NoopRefiner()
+        oversized_request = "OVERSIZED_CURRENT_REQUEST_MARKER " * 400
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = CompactionService(extractor=extractor, refiner=refiner, storage=CompactionStorage(Path(tmpdir)))
+            service.compact_transcript(
+                "stale-request-session",
+                [
+                    {"role": "assistant", "content": "Earlier investigation."},
+                    {"role": "user", "content": "Latest actionable request."},
+                ],
+                current_request=oversized_request,
+                repo_context={"repo": "coding-agent-router"},
+            )
+
+            flow = service.build_codex_handoff_flow(
+                "stale-request-session",
+                current_request="Only use this current request.",
+            )
+
+        self.assertIsNotNone(flow)
+        self.assertNotIn("current_request", flow.structured_handoff)
+        self.assertNotIn("recent_raw_turns", flow.structured_handoff)
+        self.assertEqual(flow.current_request, "Only use this current request.")
+        self.assertFalse(any(oversized_request in item["content"] for item in flow.durable_memory))

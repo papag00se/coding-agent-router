@@ -208,6 +208,28 @@ class TestCompactionMainHelpers(unittest.TestCase):
         self.assertEqual(rewritten["model"], "gpt-5.3-codex-spark")
         self.assertEqual(rewrite["request_tokens"], 99_999)
 
+    def test_spark_rewrite_allows_requests_at_cap(self) -> None:
+        payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_8",
+                    "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        with (
+            patch.object(compaction_main, "settings", create=True) as mock_settings,
+            patch.object(compaction_main, "estimate_openai_tokens", return_value=114_688),
+        ):
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_spark(payload)
+        self.assertEqual(rewritten["model"], "gpt-5.3-codex-spark")
+        self.assertTrue(rewrite["eligible"])
+        self.assertTrue(rewrite["applied"])
+
     def test_direct_endpoint_helpers_cover_health_and_simple_wrappers(self) -> None:
         class DummyService:
             def invoke(self, req):
