@@ -62,6 +62,7 @@ def chunk_transcript_items_by_prompt(
     max_prompt_tokens: int,
     overlap_tokens: int,
     prompt_token_counter: Callable[[TranscriptChunk], int],
+    max_chunk_tokens: int | None = None,
 ) -> tuple[List[TranscriptChunk], List[Dict[str, Any]]]:
     if not items:
         return [], []
@@ -80,6 +81,8 @@ def chunk_transcript_items_by_prompt(
 
         while end < len(items):
             token_total += token_counts[end]
+            if max_chunk_tokens is not None and token_total > max_chunk_tokens:
+                break
             candidate_chunk = TranscriptChunk(
                 chunk_id=chunk_id,
                 start_index=start,

@@ -36,6 +36,8 @@ Behavior:
 
 - keeps a recent raw tail based on `COMPACTOR_KEEP_RAW_TOKENS`
 - chunks older items by prompt budget rather than transcript-size heuristics alone
+- enforces `COMPACTOR_TARGET_CHUNK_TOKENS` as a hard chunk-content limit instead of treating it as a soft target
+- enforces `COMPACTOR_MAX_PROMPT_TOKENS` as the hard full-request ceiling for extraction and refinement estimates
 - uses full extraction and refinement request estimation to decide boundaries
 - chunks at transcript item boundaries rather than slicing message content
 - carries overlap forward into the next chunk
@@ -47,10 +49,14 @@ Implemented in [`app/compaction/extractor.py`](/home/jesse/src/coding-agent-rout
 Behavior:
 
 - calls the compactor model in Ollama JSON mode
+- sends a compact ordered event stream instead of the original verbose transcript JSON
+- preserves chronology while stripping tool-call wrapper noise such as `type`, `id`, `yield_time_ms`, and `max_output_tokens`
+- encodes empty `write_stdin` polls as compact `poll` events instead of empty input blobs
 - supplies a strict extraction system prompt
 - estimates full request size with a tokenizer-based prompt counter
 - keeps `COMPACTOR_NUM_CTX` as the normal request context but may burst to `COMPACTOR_BURST_NUM_CTX`
-- refuses requests that cannot leave the minimum output budget for valid JSON
+- keeps the estimated full extraction request at or under `COMPACTOR_MAX_PROMPT_TOKENS`
+- avoids requests that cannot fit an estimated safe request budget within context
 - validates responses into `ChunkExtraction`
 
 Prompt source:
@@ -76,8 +82,10 @@ Behavior:
 
 - takes deterministic merged state as the source of truth
 - requests a bounded patch rather than a full state rewrite
+- sends recent raw turns to the refiner as the same compact ordered event stream used by extraction
 - estimates full request size with a tokenizer-based prompt counter
-- caps each refinement iteration to about `8000` tokens of `recent_raw_turns` even if the prompt budget could fit more
+- keeps the estimated full refinement request at or under `COMPACTOR_MAX_PROMPT_TOKENS`
+- caps each refinement iteration to about `8000` tokens of recent raw context even if the prompt budget could fit more
 - may skip refinement entirely when the base merged-state prompt already exceeds refinement budget
 - skips oversize recent-raw items that still cannot fit into a refinement iteration
 - rejects malformed or non-JSON model output

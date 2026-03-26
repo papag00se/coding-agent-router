@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from unittest import mock
 
@@ -50,7 +51,7 @@ class TestCompactionExtractor(unittest.TestCase):
         self.assertEqual(result.files_touched, ["README.md"])
         self.assertEqual(client.calls[0]["response_format"], "json")
         self.assertFalse(client.calls[0]["think"])
-        self.assertEqual(client.calls[0]["max_tokens"], 10895)
+        self.assertIsNone(client.calls[0]["max_tokens"])
 
     def test_extract_chunk_response_budget_respects_remaining_context(self):
         extractor = CompactionExtractor(client=_FakeClient("{}"), model="qwen-test", temperature=0.0, num_ctx=16384)
@@ -71,7 +72,7 @@ class TestCompactionExtractor(unittest.TestCase):
             extractor.extract_chunk(chunk)
 
         self.assertEqual(client.calls[0]["num_ctx"], 17408)
-        self.assertEqual(client.calls[0]["max_tokens"], 1152)
+        self.assertIsNone(client.calls[0]["max_tokens"])
 
     def test_extract_chunk_rejects_non_json_output(self):
         extractor = CompactionExtractor(client=_FakeClient("not json"), model="qwen-test", temperature=0.0, num_ctx=12000)
@@ -112,9 +113,56 @@ class TestCompactionExtractor(unittest.TestCase):
         self.assertEqual(result.repo_state, {"summary": "Working in /repo with regions us-west-2 and us-east-1"})
 
     def test_extraction_prompt_is_explicit_and_payload_declares_contract(self):
-        chunk = TranscriptChunk(chunk_id=1, start_index=0, end_index=1, token_count=50, items=[{"role": "user", "content": "rename it"}])
+        chunk = TranscriptChunk(
+            chunk_id=1,
+            start_index=0,
+            end_index=2,
+            token_count=50,
+            items=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "exec_command",
+                            "input": {
+                                "cmd": "sed -n '1,40p' app/main.py",
+                                "workdir": "/repo",
+                                "yield_time_ms": 1000,
+                                "max_output_tokens": 1200,
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "write_stdin",
+                            "input": {
+                                "session_id": 123,
+                                "chars": "",
+                                "yield_time_ms": 1000,
+                            },
+                        }
+                    ],
+                },
+                {"role": "user", "content": "rename it"},
+            ],
+        )
         payload = build_extraction_payload(chunk, {"repo": "coding-agent-router"})
+        parsed = json.loads(payload)
 
         self.assertIn("Return exactly one JSON object and nothing else.", EXTRACTION_SYSTEM_PROMPT)
-        self.assertIn("output_contract", payload)
-        self.assertIn("required_keys", payload)
+        self.assertIn("output_contract", parsed)
+        self.assertIn("required_keys", parsed["output_contract"])
+        self.assertEqual(parsed["chunk"]["id"], 1)
+        self.assertEqual(
+            parsed["chunk"]["events"][:3],
+            [
+                {"r": "a", "k": "cmd", "c": "sed -n '1,40p' app/main.py", "wd": "/repo"},
+                {"r": "a", "k": "poll", "sid": 123},
+                {"r": "u", "k": "msg", "c": "rename it"},
+            ],
+        )

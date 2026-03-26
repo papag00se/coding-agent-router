@@ -156,6 +156,109 @@ class TestCompactionMainHelpers(unittest.TestCase):
         self.assertEqual(compaction_main._qualifying_spark_category(test_payload), "targeted_test")
         self.assertEqual(compaction_main._qualifying_spark_category(polling_payload), "polling")
 
+    def test_spark_rewrite_classifier_covers_extended_bounded_categories(self) -> None:
+        test_fix_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_test",
+                    "output": "Command: /bin/bash -lc '.venv/bin/python -m pytest tests/test_router.py'\nFAILED tests/test_router.py::test_handles_error\nTraceback (most recent call last):\n  File \"tests/test_router.py\", line 12, in test_handles_error\nAssertionError\n",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_read_after_test",
+                    "output": "Command: /bin/bash -lc \"sed -n '1,220p' app/router.py\"\nOutput:\nfrom app import router\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Fix tests/test_router.py."}],
+                },
+            ],
+        }
+        diff_followup_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_diff",
+                    "output": "Command: /bin/bash -lc 'git diff -- app/router.py tests/test_router.py'\ndiff --git a/app/router.py b/app/router.py\n--- a/app/router.py\n+++ b/app/router.py\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Tweak the review comment cleanup in app/router.py and tests/test_router.py."}],
+                },
+            ],
+        }
+        stacktrace_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_trace",
+                    "output": "Command: /bin/bash -lc '.venv/bin/python -m pytest tests/test_router.py'\nTraceback (most recent call last):\n  File \"/repo/app/router.py\", line 22, in route\nValueError: bad route\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Debug the failing stacktrace in /repo/app/router.py."}],
+                },
+            ],
+        }
+        localized_edit_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_read",
+                    "output": "Command: /bin/bash -lc \"sed -n '1,220p' app/router.py\"\nOutput:\nfrom app import router\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Update app/router.py to adjust route selection."}],
+                },
+            ],
+        }
+        small_refactor_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_rg",
+                    "output": "Command: /bin/bash -lc 'rg -n \"functionName\" app/router.py tests/test_router.py'\napp/router.py:10:def functionName():\ntests/test_router.py:8:functionName()\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Rename functionName in app/router.py and tests/test_router.py."}],
+                },
+            ],
+        }
+        synthesis_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_findings",
+                    "output": "Command: /bin/bash -lc 'rg -n \"spark\" app/router.py docs/spec/routing.md'\napp/router.py:20:spark\ndocs/spec/routing.md:5:spark\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Summarize the findings in app/router.py and docs/spec/routing.md with next steps."}],
+                },
+            ],
+        }
+        self.assertEqual(compaction_main._qualifying_spark_category(test_fix_payload), "test_fix_loop")
+        self.assertEqual(compaction_main._qualifying_spark_category(diff_followup_payload), "diff_followup")
+        self.assertEqual(compaction_main._qualifying_spark_category(stacktrace_payload), "stacktrace_triage")
+        self.assertEqual(compaction_main._qualifying_spark_category(localized_edit_payload), "localized_edit")
+        self.assertEqual(compaction_main._qualifying_spark_category(small_refactor_payload), "small_refactor")
+        self.assertEqual(compaction_main._qualifying_spark_category(synthesis_payload), "simple_synthesis")
+
     def test_spark_rewrite_respects_rate_and_context_limit(self) -> None:
         payload = {
             "model": "gpt-5.4",

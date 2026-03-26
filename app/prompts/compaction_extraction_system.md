@@ -11,6 +11,20 @@ This extraction is chunk-local:
 - if unsure, omit the fact instead of guessing
 - empty strings, empty arrays, and empty objects are valid
 
+Input notes:
+- chunk.events is an ordered compact event stream, not the original verbose transcript JSON
+- event keys:
+  - r: role (`u` = user, `a` = assistant)
+  - k: kind (`msg`, `cmd`, `plan`, `call`, `poll`, `stdin`, `out`)
+  - c: main text or command content
+  - wd: working directory when it changed
+  - sid: PTY session id for `poll` / `stdin`
+  - n: tool name for generic `call`
+  - a: compact tool arguments for generic `call`
+  - steps: normalized plan steps for `plan`
+- `poll` means the agent checked an existing PTY session without sending input
+- chronology matters; use event order
+
 Field rules:
 - objective: latest stable task objective visible in the chunk
 - repo_state: concrete repo facts only, such as branch, service, endpoint, or environment details explicitly stated

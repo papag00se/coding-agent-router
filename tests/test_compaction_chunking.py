@@ -68,6 +68,22 @@ class TestCompactionChunking(unittest.TestCase):
         self.assertEqual(skipped, [])
         self.assertEqual([len(chunk.items) for chunk in chunks], [2, 2])
 
+    def test_chunk_transcript_items_by_prompt_enforces_hard_chunk_token_limit(self):
+        items = [{"role": "user", "content": "x" * 2000} for _ in range(4)]
+
+        chunks, skipped = chunk_transcript_items_by_prompt(
+            items,
+            target_prompt_tokens=5000,
+            max_prompt_tokens=5000,
+            overlap_tokens=0,
+            prompt_token_counter=lambda chunk: 500,
+            max_chunk_tokens=1200,
+        )
+
+        self.assertEqual(skipped, [])
+        self.assertEqual([len(chunk.items) for chunk in chunks], [2, 2])
+        self.assertTrue(all(chunk.token_count <= 1200 for chunk in chunks))
+
     def test_chunk_transcript_items_by_prompt_skips_oversize_single_item(self):
         items = [
             {"role": "user", "content": "small"},

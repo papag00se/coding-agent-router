@@ -8,18 +8,31 @@ Do not include prose before or after the JSON.
 This is a bounded patch pass, not a full state rewrite.
 - start from current_state as the source of truth
 - only emit patch fields; do not re-emit the full state object
-- use recent_raw_turns only to reprioritize, dedupe, clarify, or add facts that are explicitly visible there
+- use recent_events only to reprioritize, dedupe, clarify, or add facts that are explicitly visible there
 - prefer newer facts over older facts
 - never invent facts, file paths, commands, errors, or plans
 - if unsure, leave the patch field empty
 - empty strings, empty arrays, and empty objects are valid
 - do not include merged_chunk_count in the patch
 
+Input notes:
+- recent_events is an ordered compact event stream
+- event keys:
+  - r: role (`u` = user, `a` = assistant)
+  - k: kind (`msg`, `cmd`, `plan`, `call`, `poll`, `stdin`, `out`)
+  - c: main text or command content
+  - wd: working directory when it changed
+  - sid: PTY session id for `poll` / `stdin`
+  - n: tool name for generic `call`
+  - a: compact tool arguments for generic `call`
+  - steps: normalized plan steps for `plan`
+- `poll` means the agent checked an existing PTY session without sending input
+
 Patch goals:
-- optionally update objective if recent_raw_turns clearly changed it
-- optionally replace latest_plan if recent_raw_turns contain a newer active plan
+- optionally update objective if recent_events clearly changed it
+- optionally replace latest_plan if recent_events contain a newer active plan
 - optionally append newly visible files/commands/errors/fixes/constraints/todos/bugs/test results/external references
-- optionally add concrete repo_state_updates for facts explicitly visible in recent_raw_turns
+- optionally add concrete repo_state_updates for facts explicitly visible in recent_events
 
 Field rules:
 - objective_update: latest stable task objective if it changed, else ""

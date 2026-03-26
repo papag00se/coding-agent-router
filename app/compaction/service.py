@@ -38,7 +38,8 @@ class CompactionService:
         repo_context: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[..., None]] = None,
     ) -> SessionHandoff:
-        normalized = normalize_transcript_for_compaction(items, max_item_tokens=settings.compactor_max_chunk_tokens)
+        hard_chunk_tokens = self._extraction_hard_chunk_tokens()
+        normalized = normalize_transcript_for_compaction(items, max_item_tokens=hard_chunk_tokens)
         _emit_progress(
             progress_callback,
             'normalize_completed',
@@ -47,25 +48,26 @@ class CompactionService:
         )
         compactable, recent_raw_turns = split_recent_raw_turns(normalized.compactable_items, settings.compactor_keep_raw_tokens)
         recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, normalized.preserved_tail)
-        target_prompt_tokens = self.extractor.target_prompt_tokens()
-        max_prompt_tokens = self.extractor.max_prompt_tokens()
+        extraction_prompt_limit = self._extraction_max_prompt_tokens()
         chunks, skipped_items = chunk_transcript_items_by_prompt(
             compactable,
-            target_prompt_tokens=min(settings.compactor_target_chunk_tokens, target_prompt_tokens, max_prompt_tokens),
-            max_prompt_tokens=max_prompt_tokens,
+            target_prompt_tokens=extraction_prompt_limit,
+            max_prompt_tokens=extraction_prompt_limit,
             overlap_tokens=settings.compactor_overlap_tokens,
             prompt_token_counter=lambda chunk: estimate_extraction_request_tokens(
                 chunk,
                 repo_context,
                 model=self.extractor.model,
             ),
+            max_chunk_tokens=hard_chunk_tokens,
         )
         _emit_progress(
             progress_callback,
             'chunking_completed',
             chunk_count=len(chunks),
             skipped_item_count=len(skipped_items),
-            max_prompt_tokens=max_prompt_tokens,
+            max_prompt_tokens=extraction_prompt_limit,
+            max_chunk_tokens=hard_chunk_tokens,
         )
         if skipped_items:
             recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, skipped_items)
@@ -127,7 +129,7 @@ class CompactionService:
         repo_context: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[..., None]] = None,
     ) -> SessionHandoff:
-        if estimate_tokens(items) < settings.compactor_target_chunk_tokens:
+        if estimate_tokens(items) < self._extraction_hard_chunk_tokens():
             existing = self.load_latest_handoff(session_id)
             if existing is not None:
                 return existing
@@ -232,10 +234,20 @@ class CompactionService:
         return state
 
     def _refinement_max_prompt_tokens(self) -> int:
-        return self.refiner.max_prompt_tokens()
+        configured = getattr(settings, 'compactor_max_prompt_tokens', self.refiner.max_prompt_tokens())
+        return max(1, min(configured, self.refiner.max_prompt_tokens()))
 
     def _refinement_target_prompt_tokens(self, max_prompt_tokens: int) -> int:
-        return max(1, min(max_prompt_tokens, self.refiner.target_prompt_tokens()))
+        return max_prompt_tokens
+
+    def _extraction_hard_chunk_tokens(self) -> int:
+        configured = getattr(settings, 'compactor_target_chunk_tokens', self.extractor.target_prompt_tokens())
+        legacy_max = getattr(settings, 'compactor_max_chunk_tokens', configured)
+        return max(1, min(configured, legacy_max))
+
+    def _extraction_max_prompt_tokens(self) -> int:
+        configured = getattr(settings, 'compactor_max_prompt_tokens', self.extractor.max_prompt_tokens())
+        return max(1, min(configured, self.extractor.max_prompt_tokens()))
 
     def _refinement_target_recent_raw_tokens(self) -> int:
         return _REFINEMENT_RECENT_RAW_TARGET_TOKENS

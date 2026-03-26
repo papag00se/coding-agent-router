@@ -41,4 +41,5 @@ Defined in [`app/compaction_main.py`](/home/jesse/src/coding-agent-router/app/co
 - Inline compaction is detected from the configured sentinel in `instructions` or the current user turn
 - Ordinary passthrough requests are proxied to `OPENAI_PASSTHROUGH_BASE_URL`
 - Qualifying passthrough requests may be rewritten from `gpt-5.4` to `CODEX_SPARK_MODEL`
-- Spark qualification uses the latest significant `function_call_output`, a tokenizer-based request-size estimate, and `CODEX_SPARK_QUALIFIED_RATE`
+- Spark qualification uses a deterministic recent-payload classifier, a tokenizer-based request-size estimate, and `CODEX_SPARK_QUALIFIED_RATE`
+- The current classifier covers retrieval, direct file reads, targeted tests, polling, localized edit loops, bounded test-fix loops, diff follow-ups, stacktrace triage, small refactors, and simple bounded synthesis

@@ -33,6 +33,11 @@ _TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
 _UPSTREAM = requests.Session()
 _SPARK_MAX_REQUEST_TOKENS = 114_688
 _SHELL_WRAPPER = re.compile(r"^(?:/bin/)?bash\s+-lc\s+(['\"])(?P<inner>.*)\1$", re.DOTALL)
+_FILE_REF_RE = re.compile(r"(?:(?:\.\.?/|/)?[\w.-]+/)+[\w.-]+\.[A-Za-z0-9_+-]{1,10}")
+_STACKTRACE_RE = re.compile(
+    r"(?:Traceback \(most recent call last\)|AssertionError|TypeError|ValueError|RuntimeError|SyntaxError|ReferenceError|Error:|FAILED\b|E\s+.+)",
+    re.IGNORECASE,
+)
 
 
 def _record_transport_event(event: str, **fields: Any) -> None:
@@ -160,13 +165,28 @@ def _rewrite_passthrough_payload_for_spark(payload: Dict[str, Any]) -> tuple[Dic
 
 
 def _qualifying_spark_category(payload: Dict[str, Any]) -> str | None:
-    latest_item = _latest_significant_input_item(payload.get('input'))
-    if not isinstance(latest_item, dict) or latest_item.get('type') != 'function_call_output':
-        return None
-    output = latest_item.get('output')
-    if not isinstance(output, str) or not output:
-        return None
-    command = _extract_command_from_tool_output(output)
+    context = _spark_context(payload)
+    latest_item = context['latest_item']
+    if isinstance(latest_item, dict) and latest_item.get('type') == 'function_call_output':
+        direct_category = _direct_spark_category(context['latest_output_command'], context['latest_output_text'])
+        if direct_category is not None:
+            return direct_category
+    if _is_diff_followup(context):
+        return 'diff_followup'
+    if _is_stacktrace_triage(context):
+        return 'stacktrace_triage'
+    if _is_test_fix_loop(context):
+        return 'test_fix_loop'
+    if _is_small_refactor(context):
+        return 'small_refactor'
+    if _is_localized_edit(context):
+        return 'localized_edit'
+    if _is_simple_synthesis(context):
+        return 'simple_synthesis'
+    return _direct_spark_category(context['latest_output_command'], context['latest_output_text'])
+
+
+def _direct_spark_category(command: str, output: str) -> str | None:
     if not command:
         return None
     if _is_file_read_command(command):
@@ -190,6 +210,85 @@ def _latest_significant_input_item(input_items: Any) -> Dict[str, Any] | None:
             continue
         return item
     return None
+
+
+def _recent_non_reasoning_items(input_items: Any, limit: int = 12) -> list[Dict[str, Any]]:
+    if not isinstance(input_items, list):
+        return []
+    items: list[Dict[str, Any]] = []
+    for item in input_items:
+        if not isinstance(item, dict) or item.get('type') == 'reasoning':
+            continue
+        items.append(item)
+    if len(items) <= limit:
+        return items
+    return items[-limit:]
+
+
+def _latest_message_text(items: list[Dict[str, Any]], role: str) -> str:
+    for item in reversed(items):
+        if item.get('type') != 'message' or item.get('role') != role:
+            continue
+        return "\n".join(_iter_message_text(item.get('content'))).strip()
+    return ''
+
+
+def _spark_context(payload: Dict[str, Any]) -> Dict[str, Any]:
+    items = _recent_non_reasoning_items(payload.get('input'))
+    latest_item = items[-1] if items else None
+    output_items = [item for item in items if item.get('type') == 'function_call_output']
+    latest_output_item = output_items[-1] if output_items else None
+    latest_output_text = ''
+    latest_output_command = ''
+    if latest_output_item is not None:
+        output = latest_output_item.get('output')
+        if isinstance(output, str):
+            latest_output_text = output
+            latest_output_command = _extract_command_from_tool_output(output)
+    recent_output_text = "\n".join(
+        item.get('output', '') for item in output_items[-6:] if isinstance(item.get('output'), str)
+    )
+    recent_commands = []
+    for item in output_items[-6:]:
+        output = item.get('output')
+        if not isinstance(output, str):
+            continue
+        command = _extract_command_from_tool_output(output)
+        if command:
+            recent_commands.append(command)
+    latest_user_text = _latest_message_text(items, 'user')
+    latest_assistant_text = _latest_message_text(items, 'assistant')
+    recent_text = "\n".join(
+        part
+        for part in [latest_user_text, latest_assistant_text, recent_output_text]
+        if part
+    )
+    file_refs = sorted(_extract_file_refs(recent_text + "\n" + "\n".join(recent_commands)))
+    return {
+        'latest_item': latest_item,
+        'latest_output_item': latest_output_item,
+        'latest_output_text': latest_output_text,
+        'latest_output_command': latest_output_command,
+        'recent_output_text': recent_output_text,
+        'recent_commands': recent_commands,
+        'latest_user_text': latest_user_text,
+        'latest_assistant_text': latest_assistant_text,
+        'latest_text': "\n".join(part for part in [latest_user_text, latest_assistant_text] if part),
+        'file_refs': file_refs,
+        'small_scope': 0 < len(file_refs) <= 3,
+    }
+
+
+def _extract_file_refs(text: str) -> set[str]:
+    if not text:
+        return set()
+    refs: set[str] = set()
+    for match in _FILE_REF_RE.findall(text):
+        normalized = match
+        if normalized.startswith('a/') or normalized.startswith('b/'):
+            normalized = normalized[2:]
+        refs.add(normalized)
+    return refs
 
 
 def _extract_command_from_tool_output(output: str) -> str:
@@ -244,6 +343,129 @@ def _is_polling_command(command: str, output: str) -> bool:
         or command == 'date'
         or command.startswith('date;')
         or command.startswith('systemctl ')
+    )
+
+
+def _has_broad_scope_keywords(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        token in lowered
+        for token in (
+            'entire repo',
+            'whole repo',
+            'codebase',
+            'repo-wide',
+            'across the repo',
+            'across the codebase',
+            'architecture',
+            'migration',
+            'root cause',
+            'investigate',
+            'review the whole',
+        )
+    )
+
+
+def _is_test_failure_output(output: str) -> bool:
+    lowered = output.lower()
+    return any(
+        token in lowered
+        for token in ('failed', 'traceback', 'assertionerror', 'error:', 'exception', 'not ok', 'exit code: 1')
+    )
+
+
+def _has_recent_command(context: Dict[str, Any], predicate) -> bool:
+    return any(predicate(command) for command in context['recent_commands'])
+
+
+def _is_test_fix_loop(context: Dict[str, Any]) -> bool:
+    if _has_broad_scope_keywords(context['latest_text']):
+        return False
+    if not context['small_scope']:
+        return False
+    if not _has_recent_command(context, _is_targeted_test_command):
+        return False
+    if not _is_test_failure_output(context['recent_output_text']):
+        return False
+    return True
+
+
+def _is_diff_followup(context: Dict[str, Any]) -> bool:
+    if _has_broad_scope_keywords(context['latest_text']):
+        return False
+    if not context['small_scope']:
+        return False
+    lowered = context['latest_text'].lower()
+    if not (
+        'review comment' in lowered
+        or 'follow up' in lowered
+        or 'cleanup' in lowered
+        or 'tweak' in lowered
+        or 'adjust' in lowered
+        or 'polish' in lowered
+        or 'nit' in lowered
+    ):
+        return False
+    return _has_recent_command(
+        context,
+        lambda command: command.startswith('git diff') or command.startswith('git show') or command.startswith('git status'),
+    )
+
+
+def _is_stacktrace_triage(context: Dict[str, Any]) -> bool:
+    if _has_broad_scope_keywords(context['latest_text']):
+        return False
+    if not context['small_scope']:
+        return False
+    if not _STACKTRACE_RE.search(context['recent_output_text']):
+        return False
+    lowered = context['latest_text'].lower()
+    return any(token in lowered for token in ('debug', 'triage', 'error', 'failing', 'failure', 'stacktrace'))
+
+
+def _is_localized_edit(context: Dict[str, Any]) -> bool:
+    if _has_broad_scope_keywords(context['latest_text']):
+        return False
+    if not context['small_scope']:
+        return False
+    lowered = context['latest_text'].lower()
+    if not any(token in lowered for token in ('change', 'update', 'adjust', 'edit', 'fix', 'modify', 'tweak')):
+        return False
+    return _has_recent_command(
+        context,
+        lambda command: _is_file_read_command(command)
+        or _is_search_inventory_command(command)
+        or _is_targeted_test_command(command)
+        or command.startswith('git diff')
+        or command.startswith('git show'),
+    )
+
+
+def _is_small_refactor(context: Dict[str, Any]) -> bool:
+    if _has_broad_scope_keywords(context['latest_text']):
+        return False
+    if not context['small_scope']:
+        return False
+    lowered = context['latest_text'].lower()
+    if not any(token in lowered for token in ('rename', 'extract', 'move', 'refactor', 'inline', 'simplify')):
+        return False
+    return _has_recent_command(context, lambda command: _is_file_read_command(command) or _is_search_inventory_command(command))
+
+
+def _is_simple_synthesis(context: Dict[str, Any]) -> bool:
+    if _has_broad_scope_keywords(context['latest_text']):
+        return False
+    if not context['small_scope']:
+        return False
+    lowered = context['latest_text'].lower()
+    if not any(
+        token in lowered
+        for token in ('summarize', 'summary', 'next steps', 'what did you find', 'what do you think', 'recommend', 'conclusion')
+    ):
+        return False
+    return _has_recent_command(
+        context,
+        lambda command: _is_file_read_command(command) or _is_search_inventory_command(command),
     )
 
 

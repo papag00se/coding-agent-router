@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from unittest import mock
 
@@ -53,7 +54,7 @@ class TestCompactionRefiner(unittest.TestCase):
         self.assertEqual(result.merged_chunk_count, 4)
         self.assertEqual(client.calls[0]["response_format"], "json")
         self.assertFalse(client.calls[0]["think"])
-        self.assertEqual(client.calls[0]["max_tokens"], 11003)
+        self.assertIsNone(client.calls[0]["max_tokens"])
 
     def test_refine_state_response_budget_respects_remaining_context(self):
         refiner = CompactionRefiner(client=_FakeClient("{}"), model="qwen-test", temperature=0.0, num_ctx=16384)
@@ -73,7 +74,7 @@ class TestCompactionRefiner(unittest.TestCase):
             refiner.refine_state(MergedState(), [{"role": "user", "content": "x"}], current_request="x")
 
         self.assertEqual(client.calls[0]["num_ctx"], 17408)
-        self.assertEqual(client.calls[0]["max_tokens"], 1152)
+        self.assertIsNone(client.calls[0]["max_tokens"])
 
     def test_refine_state_normalizes_structured_fields(self):
         client = _FakeClient(
@@ -154,14 +155,43 @@ class TestCompactionRefiner(unittest.TestCase):
     def test_refinement_prompt_and_payload_are_explicit(self):
         payload = build_refinement_payload(
             MergedState(objective="rename"),
-            [{"role": "assistant", "content": "recent raw"}],
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "write_stdin",
+                            "input": {"session_id": 55, "chars": "", "yield_time_ms": 1000},
+                        },
+                        {
+                            "type": "tool_use",
+                            "name": "update_plan",
+                            "input": {
+                                "plan": [
+                                    {"step": "inspect repo", "status": "in_progress"},
+                                    {"step": "patch route", "status": "pending"},
+                                ]
+                            },
+                        },
+                    ],
+                }
+            ],
             "finish rename",
             {"repo": "coding-agent-router"},
         )
+        parsed = json.loads(payload)
 
         self.assertIn("Return exactly one JSON object and nothing else.", REFINEMENT_SYSTEM_PROMPT)
         self.assertIn("This is a bounded patch pass, not a full state rewrite.", REFINEMENT_SYSTEM_PROMPT)
-        self.assertIn("current_state", payload)
-        self.assertIn("recent_raw_turns", payload)
-        self.assertIn("required_keys", payload)
-        self.assertIn("objective_update", payload)
+        self.assertIn("current_state", parsed)
+        self.assertIn("recent_events", parsed)
+        self.assertIn("required_keys", parsed["output_contract"])
+        self.assertIn("objective_update", parsed["output_contract"]["required_keys"])
+        self.assertEqual(
+            parsed["recent_events"],
+            [
+                {"r": "a", "k": "poll", "sid": 55},
+                {"r": "a", "k": "plan", "steps": ["inspect repo [in_progress]", "patch route [pending]"]},
+            ],
+        )

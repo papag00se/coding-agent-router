@@ -40,6 +40,7 @@ Configuration is loaded from environment variables through [`app/config.py`](/ho
 - `COMPACTOR_TIMEOUT_SECONDS`
 - `COMPACTOR_TARGET_CHUNK_TOKENS`
 - `COMPACTOR_MAX_CHUNK_TOKENS`
+- `COMPACTOR_MAX_PROMPT_TOKENS`
 - `COMPACTOR_OVERLAP_TOKENS`
 - `COMPACTOR_KEEP_RAW_TOKENS`
 - `COMPACTION_STATE_DIR`
@@ -66,6 +67,12 @@ These exist in config but are not operationally significant in the current runti
 
 `COMPACTOR_BURST_NUM_CTX` lets extractor and refiner requests temporarily raise context above the normal `COMPACTOR_NUM_CTX`. The default behavior keeps compaction at `16384` context but may expand a specific request to `17408` when the default window would leave too little room for valid JSON output.
 
+`COMPACTOR_TARGET_CHUNK_TOKENS` is the hard extraction chunk-content limit, not a soft target. The current default is `10000`.
+
+`COMPACTOR_MAX_CHUNK_TOKENS` is a legacy compatibility knob. In the current runtime it cannot raise extraction chunk size above `COMPACTOR_TARGET_CHUNK_TOKENS`; the effective hard chunk limit is the lower of the two values.
+
+`COMPACTOR_MAX_PROMPT_TOKENS` is the hard ceiling for the full extraction/refinement request estimate, including system prompt and JSON envelope. The current default is `12256`, which keeps compaction well below `12k` prompt tokens plus the existing small estimation slack.
+
 Refinement also has a built-in per-iteration cap of about `8000` recent-raw tokens. That cap is code-level behavior, not an environment-variable knob.
 
 `CODEX_SPARK_MODEL` is the upstream model id used when a qualifying non-compaction `/v1/responses` passthrough request is rewritten from `gpt-5.4` to Spark.
@@ -74,5 +81,18 @@ Refinement also has a built-in per-iteration cap of about `8000` recent-raw toke
 
 - original model `gpt-5.4`
 - tokenizer-based estimated request size at or under `114688`
-- latest significant input item is a qualifying `function_call_output`
+- a deterministic bounded-work classifier match from the recent payload
 - stable-hash sampling below the configured rate
+
+Current Spark categories are:
+
+- `file_read`
+- `search_inventory`
+- `targeted_test`
+- `polling`
+- `test_fix_loop`
+- `diff_followup`
+- `stacktrace_triage`
+- `localized_edit`
+- `small_refactor`
+- `simple_synthesis`

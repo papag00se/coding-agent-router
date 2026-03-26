@@ -167,7 +167,7 @@ class TestCompactionService(unittest.TestCase):
                 repo_context={"repo": "coding-agent-router"},
             )
 
-            self.assertGreater(len(extractor.calls), 2)
+            self.assertGreaterEqual(len(extractor.calls), 2)
             self.assertEqual(handoff.current_request, "Finish the remaining router stabilization tasks.")
             self.assertEqual(handoff.stable_task_definition, f"objective {len(extractor.calls)}")
             self.assertIn(f"fix {len(extractor.calls)}", handoff.key_decisions)
@@ -277,6 +277,39 @@ class TestCompactionService(unittest.TestCase):
         self.assertEqual(extracted_contents, ["small", "small-two"])
         self.assertIn({"role": "assistant", "content": "oversize"}, handoff.recent_raw_turns)
 
+    def test_compact_transcript_enforces_hard_extraction_prompt_ceiling(self):
+        extractor = _FakeExtractor()
+        refiner = _FakeRefiner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = CompactionService(extractor=extractor, refiner=refiner, storage=CompactionStorage(Path(tmpdir)))
+            with patch(
+                "app.compaction.service.settings",
+                SimpleNamespace(
+                    compactor_keep_raw_tokens=0,
+                    compactor_target_chunk_tokens=10000,
+                    compactor_max_chunk_tokens=10000,
+                    compactor_max_prompt_tokens=12256,
+                    compactor_overlap_tokens=0,
+                    compactor_num_ctx=16384,
+                ),
+            ), patch(
+                "app.compaction.service.estimate_extraction_request_tokens",
+                side_effect=lambda chunk, repo_context=None, model=None: 7000 + (3000 * len(chunk.items)),
+            ):
+                handoff = service.compact_transcript(
+                    "session-hard-prompt-limit",
+                    [
+                        {"role": "user", "content": "first item"},
+                        {"role": "assistant", "content": "second item"},
+                        {"role": "user", "content": "third item"},
+                    ],
+                    current_request="continue",
+                )
+
+        self.assertEqual(len(extractor.calls), 2)
+        self.assertEqual([len(chunk.items) for chunk, _repo_context in extractor.calls], [1, 1])
+        self.assertEqual(handoff.recent_raw_turns[-1], {"role": "user", "content": "third item"})
+
     def test_compact_transcript_skips_refinement_items_that_cannot_fit_minimum_output_budget(self):
         extractor = _FakeExtractor()
         refiner = _FakeRefiner()
@@ -324,7 +357,7 @@ class TestCompactionService(unittest.TestCase):
                 "app.compaction.service.settings",
                 SimpleNamespace(
                     compactor_keep_raw_tokens=20000,
-                    compactor_target_chunk_tokens=1200,
+                    compactor_target_chunk_tokens=1600,
                     compactor_max_chunk_tokens=1600,
                     compactor_overlap_tokens=0,
                     compactor_num_ctx=16000,

@@ -63,7 +63,6 @@ class CompactionExtractor:
             [{"role": "user", "content": payload}],
             temperature=self.temperature,
             num_ctx=request_num_ctx,
-            max_tokens=response_token_budget,
             system=EXTRACTION_SYSTEM_PROMPT,
             response_format="json",
             think=False,
