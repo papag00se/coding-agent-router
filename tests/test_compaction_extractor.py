@@ -49,7 +49,12 @@ class TestCompactionExtractor(unittest.TestCase):
         self.assertEqual(result.chunk_id, 3)
         self.assertEqual(result.source_token_count, 250)
         self.assertEqual(result.files_touched, ["README.md"])
-        self.assertEqual(client.calls[0]["response_format"], "json")
+        self.assertEqual(client.calls[0]["response_format"]["title"], "ChunkExtraction")
+        self.assertFalse(client.calls[0]["response_format"]["additionalProperties"])
+        self.assertEqual(client.calls[0]["response_format"]["properties"]["repo_state"]["type"], "array")
+        self.assertFalse(
+            client.calls[0]["response_format"]["properties"]["repo_state"]["items"]["additionalProperties"]
+        )
         self.assertFalse(client.calls[0]["think"])
         self.assertIsNone(client.calls[0]["max_tokens"])
 
@@ -111,6 +116,17 @@ class TestCompactionExtractor(unittest.TestCase):
         result = extractor.extract_chunk(chunk)
 
         self.assertEqual(result.repo_state, {"summary": "Working in /repo with regions us-west-2 and us-east-1"})
+
+    def test_extract_chunk_normalizes_repo_state_entry_list(self):
+        client = _FakeClient(
+            '{"repo_state":[{"key":"branch","value":"feature/router"},{"key":"service","value":"compaction"}]}'
+        )
+        extractor = CompactionExtractor(client=client, model="qwen-test", temperature=0.0, num_ctx=12000)
+        chunk = TranscriptChunk(chunk_id=5, start_index=0, end_index=1, token_count=80, items=[{"role": "user", "content": "summarize state"}])
+
+        result = extractor.extract_chunk(chunk)
+
+        self.assertEqual(result.repo_state, {"branch": "feature/router", "service": "compaction"})
 
     def test_extraction_prompt_is_explicit_and_payload_declares_contract(self):
         chunk = TranscriptChunk(

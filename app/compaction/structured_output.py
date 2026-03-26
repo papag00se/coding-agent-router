@@ -69,12 +69,70 @@ def _normalize_repo_state(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return {str(key): item for key, item in value.items() if _stringify_scalar(key)}
     if isinstance(value, list):
+        structured_entries = _normalize_repo_state_entries(value)
+        if structured_entries:
+            return structured_entries
         entries = _normalize_list(value, formatter=_format_default)
         return {"summary": "; ".join(entries)} if entries else {}
     text = _stringify_scalar(value)
     if not text:
         return {}
     return {"summary": text}
+
+
+def chunk_extraction_response_schema() -> Dict[str, Any]:
+    properties = _state_extraction_properties()
+    properties["chunk_id"] = {"title": "Chunk Id", "type": "integer"}
+    properties["source_token_count"] = {"title": "Source Token Count", "type": "integer"}
+    ordered_properties = {
+        "chunk_id": properties.pop("chunk_id"),
+        **properties,
+        "source_token_count": properties.pop("source_token_count"),
+    }
+    return _strict_object_schema("ChunkExtraction", ordered_properties)
+
+
+def recent_state_response_schema() -> Dict[str, Any]:
+    return _strict_object_schema("RecentStateExtraction", _state_extraction_properties())
+
+
+def _state_extraction_properties() -> Dict[str, Any]:
+    return {
+        "objective": {"title": "Objective", "type": "string"},
+        "repo_state": _repo_state_entries_schema("Repo State"),
+        "files_touched": _string_list_schema("Files Touched"),
+        "commands_run": _string_list_schema("Commands Run"),
+        "errors": _string_list_schema("Errors"),
+        "accepted_fixes": _string_list_schema("Accepted Fixes"),
+        "rejected_ideas": _string_list_schema("Rejected Ideas"),
+        "constraints": _string_list_schema("Constraints"),
+        "environment_assumptions": _string_list_schema("Environment Assumptions"),
+        "pending_todos": _string_list_schema("Pending Todos"),
+        "unresolved_bugs": _string_list_schema("Unresolved Bugs"),
+        "test_status": _string_list_schema("Test Status"),
+        "external_references": _string_list_schema("External References"),
+        "latest_plan": _string_list_schema("Latest Plan"),
+    }
+
+
+def merged_state_patch_response_schema() -> Dict[str, Any]:
+    properties = {
+        "objective_update": {"title": "Objective Update", "type": "string"},
+        "repo_state_updates": _repo_state_entries_schema("Repo State Updates"),
+        "add_files_touched": _string_list_schema("Add Files Touched"),
+        "add_commands_run": _string_list_schema("Add Commands Run"),
+        "add_errors": _string_list_schema("Add Errors"),
+        "add_accepted_fixes": _string_list_schema("Add Accepted Fixes"),
+        "add_rejected_ideas": _string_list_schema("Add Rejected Ideas"),
+        "add_constraints": _string_list_schema("Add Constraints"),
+        "add_environment_assumptions": _string_list_schema("Add Environment Assumptions"),
+        "add_pending_todos": _string_list_schema("Add Pending Todos"),
+        "add_unresolved_bugs": _string_list_schema("Add Unresolved Bugs"),
+        "add_test_status": _string_list_schema("Add Test Status"),
+        "add_external_references": _string_list_schema("Add External References"),
+        "latest_plan_update": _string_list_schema("Latest Plan Update"),
+    }
+    return _strict_object_schema("MergedStatePatch", properties)
 
 
 def _normalize_test_status(value: Any) -> List[str]:
@@ -99,6 +157,18 @@ def _normalize_list(value: Any, *, formatter) -> List[str]:
         text = formatter(item)
         if text:
             normalized.append(text)
+    return normalized
+
+
+def _normalize_repo_state_entries(value: List[Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        key = _stringify_scalar(item.get("key"))
+        item_value = _stringify_scalar(item.get("value"))
+        if key and item_value:
+            normalized[key] = item_value
     return normalized
 
 
@@ -138,3 +208,35 @@ def _stringify_scalar(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     return ""
+
+
+def _strict_object_schema(title: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "title": title,
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties.keys()),
+    }
+
+
+def _repo_state_entries_schema(title: str) -> Dict[str, Any]:
+    return {
+        "title": title,
+        "type": "array",
+        "items": _strict_object_schema(
+            "RepoStateEntry",
+            {
+                "key": {"title": "Key", "type": "string"},
+                "value": {"title": "Value", "type": "string"},
+            },
+        ),
+    }
+
+
+def _string_list_schema(title: str) -> Dict[str, Any]:
+    return {
+        "title": title,
+        "type": "array",
+        "items": {"type": "string"},
+    }

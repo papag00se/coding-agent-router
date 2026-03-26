@@ -7,9 +7,11 @@ from typing import Any, Dict, List, Optional
 
 from ..clients.ollama_client import OllamaClient
 from ..config import settings
-from .models import MergedState, MergedStatePatch
+from ..task_metrics import estimate_tokens
+from .merger import merge_states
+from .models import ChunkExtraction, MergedState
 from .prompts import REFINEMENT_SYSTEM_PROMPT, build_refinement_payload, estimate_refinement_request_tokens
-from .structured_output import normalize_merged_state_patch_payload
+from .structured_output import normalize_chunk_extraction_payload, recent_state_response_schema
 
 logger = logging.getLogger(__name__)
 _TOKEN_ESTIMATION_SLACK = 256
@@ -19,7 +21,7 @@ _MIN_REFINEMENT_RESPONSE_TOKENS = 512
 class CompactionRefiner:
     def __init__(
         self,
-        client: Optional[OllamaClient] = None,
+        client: Optional[Any] = None,
         *,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
@@ -78,7 +80,7 @@ class CompactionRefiner:
             temperature=self.temperature,
             num_ctx=request_num_ctx,
             system=REFINEMENT_SYSTEM_PROMPT,
-            response_format="json",
+            response_format=recent_state_response_schema(),
             think=False,
         )
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
@@ -97,8 +99,11 @@ class CompactionRefiner:
             raise ValueError(f"compaction refiner returned non-JSON output: {preview}") from exc
         if not isinstance(parsed, dict):
             raise ValueError(f"compaction refiner returned non-object output: {type(parsed).__name__}")
-        patch = MergedStatePatch.model_validate(normalize_merged_state_patch_payload(parsed))
-        if not _patch_has_effect(patch):
+        extracted_payload = normalize_chunk_extraction_payload(parsed)
+        extracted_payload.setdefault("chunk_id", state.merged_chunk_count + 1)
+        extracted_payload.setdefault("source_token_count", estimate_tokens(recent_raw_turns))
+        recent_state = ChunkExtraction.model_validate(extracted_payload)
+        if not _recent_state_has_effect(recent_state):
             logger.warning(
                 "compaction_refine_noop model=%s recent_turn_count=%s merged_chunk_count=%s",
                 self.model,
@@ -106,7 +111,9 @@ class CompactionRefiner:
                 state.merged_chunk_count,
             )
             return state
-        return _apply_patch_to_state(state, patch)
+        merged = merge_states([state, recent_state])
+        merged.merged_chunk_count = state.merged_chunk_count
+        return merged
 
     def target_prompt_tokens(self) -> int:
         return max(1, self.num_ctx - self.minimum_response_tokens - self.token_estimation_slack)
@@ -129,54 +136,20 @@ class CompactionRefiner:
         return request_num_ctx, available
 
 
-def _patch_has_effect(patch: MergedStatePatch) -> bool:
+def _recent_state_has_effect(extracted: ChunkExtraction) -> bool:
     return bool(
-        patch.objective_update
-        or patch.repo_state_updates
-        or patch.add_files_touched
-        or patch.add_commands_run
-        or patch.add_errors
-        or patch.add_accepted_fixes
-        or patch.add_rejected_ideas
-        or patch.add_constraints
-        or patch.add_environment_assumptions
-        or patch.add_pending_todos
-        or patch.add_unresolved_bugs
-        or patch.add_test_status
-        or patch.add_external_references
-        or patch.latest_plan_update
+        extracted.objective
+        or extracted.repo_state
+        or extracted.files_touched
+        or extracted.commands_run
+        or extracted.errors
+        or extracted.accepted_fixes
+        or extracted.rejected_ideas
+        or extracted.constraints
+        or extracted.environment_assumptions
+        or extracted.pending_todos
+        or extracted.unresolved_bugs
+        or extracted.test_status
+        or extracted.external_references
+        or extracted.latest_plan
     )
-
-
-def _apply_patch_to_state(state: MergedState, patch: MergedStatePatch) -> MergedState:
-    data = state.model_dump()
-    if patch.objective_update:
-        data["objective"] = patch.objective_update
-    if patch.repo_state_updates:
-        repo_state = dict(data.get("repo_state") or {})
-        repo_state.update(patch.repo_state_updates)
-        data["repo_state"] = repo_state
-    _merge_unique(data, "files_touched", patch.add_files_touched)
-    _merge_unique(data, "commands_run", patch.add_commands_run)
-    _merge_unique(data, "errors", patch.add_errors)
-    _merge_unique(data, "accepted_fixes", patch.add_accepted_fixes)
-    _merge_unique(data, "rejected_ideas", patch.add_rejected_ideas)
-    _merge_unique(data, "constraints", patch.add_constraints)
-    _merge_unique(data, "environment_assumptions", patch.add_environment_assumptions)
-    _merge_unique(data, "pending_todos", patch.add_pending_todos)
-    _merge_unique(data, "unresolved_bugs", patch.add_unresolved_bugs)
-    _merge_unique(data, "test_status", patch.add_test_status)
-    _merge_unique(data, "external_references", patch.add_external_references)
-    if patch.latest_plan_update:
-        data["latest_plan"] = patch.latest_plan_update
-    return MergedState.model_validate(data)
-
-
-def _merge_unique(data: Dict[str, Any], field_name: str, additions: List[str]) -> None:
-    if not additions:
-        return
-    existing = list(data.get(field_name) or [])
-    for item in additions:
-        if item not in existing:
-            existing.append(item)
-    data[field_name] = existing

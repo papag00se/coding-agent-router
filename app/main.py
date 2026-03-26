@@ -25,10 +25,31 @@ from .compat import (
 from .config import settings
 from .models import AnthropicMessagesRequest, CompactRequest, InvokeRequest
 from .router import RoutingService
+from .task_metrics import estimate_tokens
+from .transport_metrics import transport_metrics_snapshot
 
 app = FastAPI(title="Local Agent Router Starter", version="0.1.0")
 service = RoutingService()
 _TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
+
+
+def _configured_compactor_model() -> str:
+    return str(getattr(settings, "compactor_model", None) or "unknown")
+
+
+def _compact_request_tokens(req: CompactRequest) -> int:
+    return max(
+        0,
+        estimate_tokens(
+            {
+                "session_id": req.session_id,
+                "items": req.items,
+                "current_request": req.current_request,
+                "repo_context": req.repo_context,
+                "refresh_if_needed": req.refresh_if_needed,
+            }
+        ),
+    )
 
 
 @app.get("/health")
@@ -52,6 +73,11 @@ def ollama_tags() -> dict:
     return ollama_tags_response()
 
 
+@app.get("/internal/metrics")
+def internal_metrics() -> dict:
+    return transport_metrics_snapshot(_TRANSPORT_LOG_PATH)
+
+
 @app.get("/v1/models")
 def openai_models() -> dict:
     return openai_models_response()
@@ -65,11 +91,15 @@ def invoke(req: InvokeRequest):
 
 @app.post("/internal/compact")
 def compact(req: CompactRequest):
+    request_tokens = _compact_request_tokens(req)
     record_transport_event(
         _TRANSPORT_LOG_PATH,
         'internal_compact_start',
+        path='/internal/compact',
         session_id=req.session_id,
         refresh_if_needed=req.refresh_if_needed,
+        local_model=_configured_compactor_model(),
+        request_tokens=request_tokens,
         **compaction_payload_fields(
             before={
                 'session_id': req.session_id,
@@ -90,8 +120,11 @@ def compact(req: CompactRequest):
     record_transport_event(
         _TRANSPORT_LOG_PATH,
         'internal_compact_completed',
+        path='/internal/compact',
         session_id=req.session_id,
         refresh_if_needed=req.refresh_if_needed,
+        local_model=_configured_compactor_model(),
+        request_tokens=request_tokens,
         **compaction_payload_fields(after=handoff),
     )
     return JSONResponse(handoff)
@@ -128,4 +161,3 @@ def ollama_chat(req: Dict[str, Any]):
     if req.get("stream"):
         return StreamingResponse(iter_ollama_chat_response(response), media_type="application/x-ndjson")
     return JSONResponse(ollama_chat_response(response))
-

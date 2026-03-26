@@ -34,7 +34,7 @@ Used when the service terminates client traffic and executes locally.
 
 Used when inline local compaction should run locally while ordinary `/v1/responses` traffic is proxied upstream.
 
-The compaction companion also owns the selective Codex Spark passthrough rewrite for qualifying non-compaction Responses requests.
+The compaction companion also owns the selective Spark and mini passthrough rewrite for qualifying non-compaction Responses requests.
 
 ## Prompt Files
 

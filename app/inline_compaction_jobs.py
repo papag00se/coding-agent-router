@@ -28,6 +28,7 @@ class InlineCompactionJob:
     key: str
     request_payload: Dict[str, Any]
     request: Any
+    request_headers: Dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.monotonic)
     updated_at: float = field(default_factory=time.monotonic)
     events: List[Dict[str, Any]] = field(default_factory=list)
@@ -99,12 +100,24 @@ class InlineCompactionJob:
 
 
 class InlineCompactionJobManager:
-    def __init__(self, service: Any) -> None:
+    def __init__(
+        self,
+        service: Any,
+        *,
+        fallback_callback: Optional[Callable[..., Iterator[Dict[str, Any]]]] = None,
+    ) -> None:
         self.service = service
+        self.fallback_callback = fallback_callback
         self._lock = Lock()
         self._jobs: Dict[str, InlineCompactionJob] = {}
 
-    def get_or_create(self, payload: Dict[str, Any], request: Any) -> tuple[InlineCompactionJob, bool]:
+    def get_or_create(
+        self,
+        payload: Dict[str, Any],
+        request: Any,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> tuple[InlineCompactionJob, bool]:
         key = inline_compaction_request_key(payload)
         with self._lock:
             self._cleanup_locked()
@@ -115,7 +128,12 @@ class InlineCompactionJobManager:
                 else:
                     existing.updated_at = time.monotonic()
                     return existing, False
-            job = InlineCompactionJob(key=key, request_payload=dict(payload), request=request)
+            job = InlineCompactionJob(
+                key=key,
+                request_payload=dict(payload),
+                request=request,
+                request_headers=dict(headers or {}),
+            )
             self._jobs[key] = job
             worker = Thread(target=self._run_job, args=(job,), daemon=True)
             worker.start()
@@ -141,7 +159,25 @@ class InlineCompactionJobManager:
                 raise RuntimeError('inline compaction stream exited without a terminal event')
         except Exception as exc:
             logger.exception("inline compaction job failed key=%s", job.key)
-            job.append_event({'type': 'failed', 'message': str(exc)})
+            if self.fallback_callback is None:
+                job.append_event({'type': 'failed', 'message': str(exc)})
+                return
+            try:
+                progress('spark_fallback_started', request_key=job.key, error=str(exc))
+                for event in self.fallback_callback(
+                    job.request_payload,
+                    job.request,
+                    job.request_headers,
+                    exc,
+                    request_key=job.key,
+                    progress_callback=progress,
+                ):
+                    job.append_event(dict(event))
+                if not job.completed:
+                    raise RuntimeError('inline compaction spark fallback exited without a terminal event')
+            except Exception as fallback_exc:
+                logger.exception("inline compaction spark fallback failed key=%s", job.key)
+                job.append_event({'type': 'failed', 'message': str(fallback_exc)})
 
 
 def _default_progress_message(stage: str, fields: Dict[str, Any]) -> str:
@@ -168,6 +204,8 @@ def _default_progress_message(stage: str, fields: Dict[str, Any]) -> str:
         return 'Rendering compacted continuation state.'
     if stage == 'inline_render_completed':
         return 'Finalizing compacted continuation.'
+    if stage == 'spark_fallback_started':
+        return 'Local compaction failed validation; retrying compaction with Spark.'
     return 'Local compaction in progress.'
 
 

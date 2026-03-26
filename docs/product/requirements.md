@@ -23,7 +23,7 @@
 - The Responses surface exposes an alias tool set and maps it back to original tool names
 - Long transcripts are compacted into persisted durable memory plus a structured handoff
 - The compaction companion can intercept inline compaction locally while proxying ordinary `/v1/responses` traffic upstream
-- Qualifying non-compaction `gpt-5.4` passthrough calls can be rewritten to Codex Spark based on request shape, request size, and rollout rate
+- Qualifying non-compaction `gpt-5.4` passthrough calls can be rewritten to Codex Spark or `gpt-5.4-mini` based on request shape and request size, with Spark still gated by rollout rate
 
 ## Non-Functional Requirements
 

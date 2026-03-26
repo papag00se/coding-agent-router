@@ -32,8 +32,8 @@ class _FakeClient:
 
 
 class TestCompactionRefiner(unittest.TestCase):
-    def test_refine_state_uses_json_mode_and_validates_output(self):
-        client = _FakeClient('{"objective_update":"new objective","latest_plan_update":["step 1"]}')
+    def test_refine_state_uses_recent_state_schema_and_merges_output(self):
+        client = _FakeClient('{"objective":"new objective","latest_plan":["step 1"]}')
         refiner = CompactionRefiner(
             client=client,
             model="qwen-test",
@@ -52,7 +52,12 @@ class TestCompactionRefiner(unittest.TestCase):
         self.assertEqual(result.objective, "new objective")
         self.assertEqual(result.latest_plan, ["step 1"])
         self.assertEqual(result.merged_chunk_count, 4)
-        self.assertEqual(client.calls[0]["response_format"], "json")
+        self.assertEqual(client.calls[0]["response_format"]["title"], "RecentStateExtraction")
+        self.assertFalse(client.calls[0]["response_format"]["additionalProperties"])
+        self.assertEqual(client.calls[0]["response_format"]["properties"]["repo_state"]["type"], "array")
+        self.assertFalse(
+            client.calls[0]["response_format"]["properties"]["repo_state"]["items"]["additionalProperties"]
+        )
         self.assertFalse(client.calls[0]["think"])
         self.assertIsNone(client.calls[0]["max_tokens"])
 
@@ -64,7 +69,7 @@ class TestCompactionRefiner(unittest.TestCase):
         self.assertEqual(refiner._response_token_budget(17000), 0)
 
     def test_refine_state_uses_burst_context_when_default_window_would_starve_output(self):
-        client = _FakeClient('{"objective_update":"ok"}')
+        client = _FakeClient('{"objective":"ok"}')
         refiner = CompactionRefiner(client=client, model="qwen-test", temperature=0.0, num_ctx=16384)
 
         with mock.patch(
@@ -76,12 +81,12 @@ class TestCompactionRefiner(unittest.TestCase):
         self.assertEqual(client.calls[0]["num_ctx"], 17408)
         self.assertIsNone(client.calls[0]["max_tokens"])
 
-    def test_refine_state_normalizes_structured_fields(self):
+    def test_refine_state_normalizes_structured_fields_from_recent_state(self):
         client = _FakeClient(
             (
-                '{"repo_state_updates":"working in /repo",'
-                '"add_test_status":{"compaction":"passing"},'
-                '"latest_plan_update":[{"step":"Retry compaction","status":"in_progress"}]}'
+                '{"repo_state":"working in /repo",'
+                '"test_status":{"compaction":"passing"},'
+                '"latest_plan":[{"step":"Retry compaction","status":"in_progress"}]}'
             )
         )
         refiner = CompactionRefiner(client=client, model="qwen-test", temperature=0.0, num_ctx=12000)
@@ -97,12 +102,31 @@ class TestCompactionRefiner(unittest.TestCase):
         self.assertEqual(result.latest_plan, ["Retry compaction [in_progress]"])
         self.assertEqual(result.merged_chunk_count, 2)
 
-    def test_refine_state_applies_patch_without_overwriting_deterministic_merge(self):
+    def test_refine_state_normalizes_repo_state_entry_list(self):
         client = _FakeClient(
             (
-                '{"add_pending_todos":["verify preview minting"],'
-                '"add_errors":["scope 7 hydration mismatch"],'
-                '"add_external_references":["https://preview.api.handle.me/health"]}'
+                '{"repo_state":['
+                '{"key":"branch","value":"main"},'
+                '{"key":"endpoint","value":"127.0.0.1:8081/v1/responses"}'
+                ']}'
+            )
+        )
+        refiner = CompactionRefiner(client=client, model="qwen-test", temperature=0.0, num_ctx=12000)
+
+        result = refiner.refine_state(
+            MergedState(merged_chunk_count=2),
+            [{"role": "user", "content": "continue"}],
+            current_request="continue",
+        )
+
+        self.assertEqual(result.repo_state, {"branch": "main", "endpoint": "127.0.0.1:8081/v1/responses"})
+
+    def test_refine_state_merges_recent_state_without_overwriting_existing_lists(self):
+        client = _FakeClient(
+            (
+                '{"pending_todos":["verify preview minting"],'
+                '"errors":["scope 7 hydration mismatch"],'
+                '"external_references":["https://preview.api.handle.me/health"]}'
             )
         )
         refiner = CompactionRefiner(client=client, model="qwen-test", temperature=0.0, num_ctx=12000)
@@ -120,39 +144,25 @@ class TestCompactionRefiner(unittest.TestCase):
         )
 
         self.assertEqual(result.objective, "close lcr-05b")
-        self.assertEqual(result.pending_todos, ["rerun scope 2", "verify preview minting"])
-        self.assertEqual(result.errors, ["old error", "scope 7 hydration mismatch"])
+        self.assertEqual(result.pending_todos, ["verify preview minting", "rerun scope 2"])
+        self.assertEqual(result.errors, ["scope 7 hydration mismatch", "old error"])
         self.assertEqual(result.external_references, ["https://preview.api.handle.me/health"])
         self.assertEqual(result.merged_chunk_count, 3)
 
-    def test_refine_state_ignores_unrelated_full_state_object(self):
-        client = _FakeClient(
-            (
-                '{"objective":"Implement a secure, production-ready authentication system",'
-                '"files_touched":["src/app/auth.config.ts"],'
-                '"latest_plan":["Implement email verification flow [pending]"]}'
-            )
-        )
-        refiner = CompactionRefiner(client=client, model="qwen-test", temperature=0.0, num_ctx=12000)
+    def test_refine_state_returns_original_state_for_empty_recent_extraction(self):
+        refiner = CompactionRefiner(client=_FakeClient("{}"), model="qwen-test", temperature=0.0, num_ctx=12000)
         state = MergedState(objective="close lcr-05b", files_touched=["deploy.sh"], merged_chunk_count=5)
 
-        result = refiner.refine_state(
-            state,
-            [{"role": "user", "content": "continue"}],
-            current_request="continue",
-        )
+        result = refiner.refine_state(state, [{"role": "user", "content": "continue"}], current_request="continue")
 
-        self.assertEqual(result.objective, "close lcr-05b")
-        self.assertEqual(result.files_touched, ["deploy.sh"])
-        self.assertEqual(result.latest_plan, [])
-        self.assertEqual(result.merged_chunk_count, 5)
+        self.assertEqual(result, state)
 
     def test_refine_state_rejects_non_json_output(self):
         refiner = CompactionRefiner(client=_FakeClient("not json"), model="qwen-test", temperature=0.0, num_ctx=12000)
         with self.assertRaisesRegex(ValueError, "non-JSON output: not json"):
             refiner.refine_state(MergedState(), [{"role": "user", "content": "x"}], current_request="x")
 
-    def test_refinement_prompt_and_payload_are_explicit(self):
+    def test_refinement_prompt_and_payload_describe_recent_state_extraction(self):
         payload = build_refinement_payload(
             MergedState(objective="rename"),
             [
@@ -183,11 +193,11 @@ class TestCompactionRefiner(unittest.TestCase):
         parsed = json.loads(payload)
 
         self.assertIn("Return exactly one JSON object and nothing else.", REFINEMENT_SYSTEM_PROMPT)
-        self.assertIn("This is a bounded patch pass, not a full state rewrite.", REFINEMENT_SYSTEM_PROMPT)
-        self.assertIn("current_state", parsed)
+        self.assertIn("This is a recent-state extraction pass, not a diff or patch pass.", REFINEMENT_SYSTEM_PROMPT)
         self.assertIn("recent_events", parsed)
         self.assertIn("required_keys", parsed["output_contract"])
-        self.assertIn("objective_update", parsed["output_contract"]["required_keys"])
+        self.assertIn("objective", parsed["output_contract"]["required_keys"])
+        self.assertNotIn("current_state", parsed)
         self.assertEqual(
             parsed["recent_events"],
             [

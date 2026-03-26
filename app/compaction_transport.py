@@ -6,12 +6,17 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .config import settings
+from .transport_metrics import record_metrics_event
 
 logger = logging.getLogger(__name__)
 
 
 def record_transport_event(log_path: Path, event: str, **fields: Any) -> None:
     payload = {"event": event, **fields}
+    try:
+        record_metrics_event(log_path, payload)
+    except Exception:
+        logger.exception("failed to update transport metrics for %s", event)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")

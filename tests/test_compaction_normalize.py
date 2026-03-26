@@ -5,6 +5,16 @@ import unittest
 from app.compaction.normalize import normalize_transcript_for_compaction, sanitize_inline_compaction_payload
 
 
+def _strip_compaction_fields(items):
+    stripped = []
+    for item in items:
+        if not isinstance(item, dict):
+            stripped.append(item)
+            continue
+        stripped.append({key: value for key, value in item.items() if not str(key).startswith('_compaction_')})
+    return stripped
+
+
 class TestCompactionNormalize(unittest.TestCase):
     def test_normalize_transcript_strips_attachments_and_encrypted_content(self) -> None:
         normalized = normalize_transcript_for_compaction(
@@ -34,13 +44,13 @@ class TestCompactionNormalize(unittest.TestCase):
         )
 
         self.assertEqual(
-            normalized.compactable_items,
+            _strip_compaction_fields(normalized.compactable_items),
             [
                 {'role': 'user', 'content': [{'type': 'input_text', 'text': 'first'}]},
             ],
         )
         self.assertEqual(
-            normalized.preserved_tail,
+            _strip_compaction_fields(normalized.preserved_tail),
             [
                 {
                     'role': 'user',
@@ -61,8 +71,8 @@ class TestCompactionNormalize(unittest.TestCase):
             max_item_tokens=30,
         )
 
-        self.assertEqual(normalized.compactable_items, [{'role': 'assistant', 'content': 'older'}])
-        self.assertEqual(normalized.preserved_tail, [{'role': 'user', 'content': [{'type': 'input_text', 'text': 'x' * 500}]}])
+        self.assertEqual(_strip_compaction_fields(normalized.compactable_items), [{'role': 'assistant', 'content': 'older'}])
+        self.assertEqual(_strip_compaction_fields(normalized.preserved_tail), [{'role': 'user', 'content': [{'type': 'input_text', 'text': 'x' * 500}]}])
 
     def test_normalize_transcript_drops_historical_tool_results_and_function_outputs(self) -> None:
         normalized = normalize_transcript_for_compaction(
@@ -92,7 +102,7 @@ class TestCompactionNormalize(unittest.TestCase):
             max_item_tokens=10_000,
         )
 
-        self.assertEqual(normalized.compactable_items, [])
+        self.assertEqual(_strip_compaction_fields(normalized.compactable_items), [])
 
     def test_normalize_transcript_preserves_latest_raw_tool_result_turn(self) -> None:
         normalized = normalize_transcript_for_compaction(
@@ -112,9 +122,9 @@ class TestCompactionNormalize(unittest.TestCase):
             max_item_tokens=10_000,
         )
 
-        self.assertEqual(normalized.compactable_items, [{'role': 'assistant', 'content': 'older'}])
+        self.assertEqual(_strip_compaction_fields(normalized.compactable_items), [{'role': 'assistant', 'content': 'older'}])
         self.assertEqual(
-            normalized.preserved_tail,
+            _strip_compaction_fields(normalized.preserved_tail),
             [
                 {
                     'role': 'user',
@@ -123,6 +133,49 @@ class TestCompactionNormalize(unittest.TestCase):
                             'type': 'tool_result',
                             'tool_use_id': 'call_1',
                             'content': '{"type":"input_image","image_url":"data:image/png;base64,AAAA"}',
+                        }
+                    ],
+                }
+            ],
+        )
+
+    def test_normalize_transcript_routes_prior_machine_summary_out_of_compactable_items(self) -> None:
+        normalized = normalize_transcript_for_compaction(
+            [
+                {
+                    'role': 'assistant',
+                    'content': [
+                        {
+                            'type': 'output_text',
+                            'text': (
+                                'Another language model started to solve this problem and produced a summary of its thinking process.\n'
+                                'Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n'
+                                '## Thread Summary for Continuation\n\n'
+                                '### Latest Real User Intent\nFix the deploy path.\n'
+                            ),
+                        }
+                    ],
+                },
+                {'role': 'user', 'content': 'latest'},
+            ],
+            max_item_tokens=10_000,
+        )
+
+        self.assertEqual(_strip_compaction_fields(normalized.compactable_items), [])
+        self.assertEqual(
+            _strip_compaction_fields(normalized.precompacted_items),
+            [
+                {
+                    'role': 'assistant',
+                    'content': [
+                        {
+                            'type': 'output_text',
+                            'text': (
+                                'Another language model started to solve this problem and produced a summary of its thinking process.\n'
+                                'Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n'
+                                '## Thread Summary for Continuation\n\n'
+                                '### Latest Real User Intent\nFix the deploy path.\n'
+                            ),
                         }
                     ],
                 }

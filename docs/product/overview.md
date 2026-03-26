@@ -20,7 +20,7 @@ Both share the same routing core in [`app/router.py`](/home/jesse/src/coding-age
 - Structured tool handling on the local coder lane
 - Durable transcript compaction with persisted handoff artifacts
 - Compaction companion mode that intercepts inline local compaction while proxying ordinary Responses traffic upstream
-- Selective passthrough rewrite from `gpt-5.4` to `gpt-5.3-codex-spark` for qualifying non-compaction Responses calls
+- Selective passthrough rewrite from `gpt-5.4` to `gpt-5.3-codex-spark` or `gpt-5.4-mini` for qualifying non-compaction Responses calls, with image-bearing requests kept off the Spark lane
 
 ## Product Boundary
 

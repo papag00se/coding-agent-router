@@ -9,7 +9,7 @@ from ..clients.ollama_client import OllamaClient
 from ..config import settings
 from .models import ChunkExtraction, TranscriptChunk
 from .prompts import EXTRACTION_SYSTEM_PROMPT, build_extraction_payload, estimate_extraction_request_tokens
-from .structured_output import normalize_chunk_extraction_payload
+from .structured_output import chunk_extraction_response_schema, normalize_chunk_extraction_payload
 
 logger = logging.getLogger(__name__)
 _TOKEN_ESTIMATION_SLACK = 256
@@ -19,7 +19,7 @@ _MIN_EXTRACTION_RESPONSE_TOKENS = 1024
 class CompactionExtractor:
     def __init__(
         self,
-        client: Optional[OllamaClient] = None,
+        client: Optional[Any] = None,
         *,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
@@ -64,7 +64,7 @@ class CompactionExtractor:
             temperature=self.temperature,
             num_ctx=request_num_ctx,
             system=EXTRACTION_SYSTEM_PROMPT,
-            response_format="json",
+            response_format=chunk_extraction_response_schema(),
             think=False,
         )
         elapsed_ms = int((time.monotonic() - started_at) * 1000)

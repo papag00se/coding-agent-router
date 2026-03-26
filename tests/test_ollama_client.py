@@ -83,6 +83,23 @@ class TestOllamaClient(unittest.TestCase):
         self.assertNotIn("tools", payload)
         self.assertEqual(payload["messages"], [{"role": "user", "content": "hi"}])
 
+    def test_chat_accepts_schema_response_format(self) -> None:
+        client = OllamaClient("http://127.0.0.1:11434", 5)
+        fake_session = _FakeSession()
+        fake_session.response = _FakeResponse(payload={"done": True})
+        client.session = fake_session
+
+        schema = {"title": "ChunkExtraction", "type": "object", "properties": {"objective": {"type": "string"}}}
+        client.chat(
+            "model",
+            [{"role": "user", "content": "hi"}],
+            temperature=0.0,
+            num_ctx=1024,
+            response_format=schema,
+        )
+
+        self.assertEqual(fake_session.calls[0]["json"]["format"], schema)
+
     def test_chat_stream_yields_json_lines_and_skips_blanks(self) -> None:
         client = OllamaClient("http://127.0.0.1:11434", 5)
         fake_session = _FakeSession()

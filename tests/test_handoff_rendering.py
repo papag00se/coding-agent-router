@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.compaction.handoff import build_codex_handoff_flow, render_codex_support_prompt, render_inline_compaction_summary
+from app.compaction.handoff import build_codex_handoff_flow, render_codex_support_prompt, render_inline_compaction_summary, validate_codex_handoff_flow
 from app.compaction.models import CodexHandoffFlow, DurableMemorySet, SessionHandoff
 
 
@@ -76,3 +76,33 @@ class TestHandoffRendering(unittest.TestCase):
         session_handoff = next(item["content"] for item in flow.durable_memory if item["name"] == "SESSION_HANDOFF.md")
         self.assertNotIn("stale oversized request", session_handoff)
         self.assertNotIn("Current Request", session_handoff)
+
+    def test_validate_codex_handoff_flow_rejects_empty_memory_entry_name(self):
+        with self.assertRaisesRegex(ValueError, "durable memory entries require a non-empty name"):
+            validate_codex_handoff_flow(
+                {
+                    "durable_memory": [
+                        {"name": "", "content": "# Task State\n- rename service\n"},
+                    ],
+                    "structured_handoff": {"stable_task_definition": "rename service"},
+                    "recent_raw_turns": [],
+                    "current_request": "Finish the rename.",
+                }
+            )
+
+    def test_validate_codex_handoff_flow_rejects_invalid_structured_schema(self):
+        with self.assertRaisesRegex(ValueError, "structured payload failed schema validation"):
+            validate_codex_handoff_flow(
+                {
+                    "durable_memory": [
+                        {"name": "TASK_STATE.md", "content": "# Task State\n- rename service\n"},
+                        {"name": "DECISIONS.md", "content": "# Decisions\n- keep change minimal\n"},
+                        {"name": "FAILURES_TO_AVOID.md", "content": "# Failures To Avoid\n- repeat tool leak\n"},
+                        {"name": "NEXT_STEPS.md", "content": "# Next Steps\n- rerun browser test\n"},
+                        {"name": "SESSION_HANDOFF.md", "content": "# Session Handoff\n- continue work\n"},
+                    ],
+                    "structured_handoff": {"stable_task_definition": ["rename service"]},
+                    "recent_raw_turns": [],
+                    "current_request": "Finish the rename.",
+                }
+            )

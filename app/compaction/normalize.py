@@ -15,6 +15,7 @@ _CODEX_BOOTSTRAP_PREFIX = 'You are Codex'
 @dataclass
 class NormalizedTranscript:
     compactable_items: List[Dict[str, Any]] = field(default_factory=list)
+    precompacted_items: List[Dict[str, Any]] = field(default_factory=list)
     preserved_tail: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -31,17 +32,20 @@ def normalize_transcript_for_compaction(
     *,
     max_item_tokens: int,
 ) -> NormalizedTranscript:
-    raw_items = [_sanitize_raw_item(item) for item in items]
+    raw_items = [_annotate_compaction_index(_sanitize_raw_item(item), index) for index, item in enumerate(items)]
     latest_index = next((index for index in range(len(raw_items) - 1, -1, -1) if raw_items[index] is not None), None)
 
     normalized = NormalizedTranscript()
     if latest_index is not None and raw_items[latest_index] is not None:
         normalized.preserved_tail.append(raw_items[latest_index])
 
-    for index, item in enumerate(items):
+    for index, raw_item in enumerate(raw_items):
         if index == latest_index:
             continue
-        compactable = _sanitize_compactable_item(item, max_item_tokens=max_item_tokens)
+        precompacted, remaining = _split_precompacted_item(raw_item)
+        if precompacted is not None:
+            normalized.precompacted_items.append(precompacted)
+        compactable = _sanitize_compactable_item_from_raw(remaining, max_item_tokens=max_item_tokens)
         if compactable is not None:
             normalized.compactable_items.append(compactable)
     return normalized
@@ -64,6 +68,10 @@ def _sanitize_raw_item(item: Any) -> Optional[Dict[str, Any]]:
 
 def _sanitize_compactable_item(item: Any, *, max_item_tokens: int) -> Optional[Dict[str, Any]]:
     raw_item = _sanitize_raw_item(item)
+    return _sanitize_compactable_item_from_raw(raw_item, max_item_tokens=max_item_tokens)
+
+
+def _sanitize_compactable_item_from_raw(raw_item: Any, *, max_item_tokens: int) -> Optional[Dict[str, Any]]:
     if raw_item is None:
         return None
     if 'content' not in raw_item:
@@ -85,6 +93,45 @@ def _sanitize_compactable_item(item: Any, *, max_item_tokens: int) -> Optional[D
     compactable_item = dict(raw_item)
     compactable_item['content'] = blocks
     return compactable_item
+
+
+def _annotate_compaction_index(item: Optional[Dict[str, Any]], index: int) -> Optional[Dict[str, Any]]:
+    if item is None:
+        return None
+    annotated = dict(item)
+    annotated['_compaction_index'] = index
+    return annotated
+
+
+def _split_precompacted_item(raw_item: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    if raw_item is None:
+        return None, None
+    content = raw_item.get('content')
+    if isinstance(content, str):
+        if _is_precompacted_summary_text(content):
+            return raw_item, None
+        return None, raw_item
+    if not isinstance(content, list):
+        return None, raw_item
+
+    precompacted_blocks: List[Dict[str, Any]] = []
+    remaining_blocks: List[Dict[str, Any]] = []
+    for block in content:
+        if _is_precompacted_summary_block(block):
+            precompacted_blocks.append(block)
+        else:
+            remaining_blocks.append(block)
+
+    precompacted_item = None
+    if precompacted_blocks:
+        precompacted_item = dict(raw_item)
+        precompacted_item['content'] = precompacted_blocks
+
+    remaining_item = None
+    if remaining_blocks:
+        remaining_item = dict(raw_item)
+        remaining_item['content'] = remaining_blocks
+    return precompacted_item, remaining_item
 
 
 def _sanitize_raw_content(content: Any) -> Optional[Any]:
@@ -129,6 +176,25 @@ def _sanitize_compactable_block(block: Any, *, max_item_tokens: int) -> Optional
     if block_type in _STRUCTURED_BLOCK_TYPES:
         return raw_block if estimate_tokens(raw_block) <= max_item_tokens else None
     return None
+
+
+def _is_precompacted_summary_block(block: Dict[str, Any]) -> bool:
+    block_type = block.get('type')
+    if block_type not in _TEXT_BLOCK_TYPES:
+        return False
+    text = block.get('text') or block.get('input_text') or block.get('output_text') or ''
+    return _is_precompacted_summary_text(text)
+
+
+def _is_precompacted_summary_text(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    normalized = text.strip()
+    if not normalized:
+        return False
+    if normalized.startswith('Another language model started to solve this problem and produced a summary of its thinking process.'):
+        return True
+    return '## Thread Summary for Continuation' in normalized and 'Latest Real User Intent' in normalized
 
 
 def _strip_encrypted_content(value: Any) -> Any:

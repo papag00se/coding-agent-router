@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from ..config import settings
 from ..prompt_loader import load_prompt
 from ..task_metrics import estimate_model_tokens
-from .models import ChunkExtraction, MergedState, MergedStatePatch, TranscriptChunk
+from .models import ChunkExtraction, MergedState, TranscriptChunk
 
 
 EXTRACTION_SYSTEM_PROMPT = load_prompt('compaction_extraction_system.md')
@@ -49,14 +49,18 @@ def build_refinement_payload(
     current_request: str,
     repo_context: Optional[Dict[str, Any]] = None,
 ) -> str:
+    _ = state
     return json.dumps(
         {
-            "task": "Return a bounded patch over merged durable coding-session state using newer recent raw turns.",
+            "task": "Extract durable coding-session state from newer recent raw turns so it can be merged onto the existing merged state.",
             "output_contract": {
                 "format": "json_object_only",
-                "required_keys": list(MergedStatePatch.model_fields.keys()),
+                "required_keys": [
+                    key
+                    for key in ChunkExtraction.model_fields.keys()
+                    if key not in {"chunk_id", "source_token_count"}
+                ],
             },
-            "current_state": state.model_dump(),
             "recent_events": _compact_transcript_events(recent_raw_turns),
             "current_request": current_request,
             "repo_context": repo_context or {},

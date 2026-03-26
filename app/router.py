@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -21,6 +22,8 @@ from .tool_adapter import (
     recover_ollama_message,
     recover_stream_ollama_message,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def flatten_content(content: Any) -> str:
@@ -278,13 +281,19 @@ class RoutingService:
         req: AnthropicMessagesRequest,
         *,
         progress_callback: Optional[Callable[..., None]] = None,
+        response_model: Optional[str] = None,
+        raw_backend_mode: str = 'chunked_durable_compaction',
     ) -> Dict[str, Any]:
-        text, raw_backend = self._inline_compaction_result(req, progress_callback=progress_callback)
+        text, raw_backend = self._inline_compaction_result(
+            req,
+            progress_callback=progress_callback,
+            raw_backend_mode=raw_backend_mode,
+        )
         return {
             'id': 'msg_router_local',
             'type': 'message',
             'role': 'assistant',
-            'model': settings.compactor_model,
+            'model': response_model or self._inline_compaction_response_model(),
             'content': [{'type': 'text', 'text': text}],
             'stop_reason': 'end_turn',
             'stop_sequence': None,
@@ -301,8 +310,14 @@ class RoutingService:
         req: AnthropicMessagesRequest,
         *,
         progress_callback: Optional[Callable[..., None]] = None,
+        response_model: Optional[str] = None,
+        raw_backend_mode: str = 'chunked_durable_compaction',
     ) -> Iterator[Dict[str, Any]]:
-        full_text, final_raw = self._inline_compaction_result(req, progress_callback=progress_callback)
+        full_text, final_raw = self._inline_compaction_result(
+            req,
+            progress_callback=progress_callback,
+            raw_backend_mode=raw_backend_mode,
+        )
         if full_text:
             yield {'type': 'text_delta', 'delta': full_text}
         yield {
@@ -311,7 +326,7 @@ class RoutingService:
                 'id': 'msg_router_local',
                 'type': 'message',
                 'role': 'assistant',
-                'model': settings.compactor_model,
+                'model': response_model or self._inline_compaction_response_model(),
                 'content': [{'type': 'text', 'text': full_text}],
                 'stop_reason': 'end_turn',
                 'stop_sequence': None,
@@ -326,6 +341,7 @@ class RoutingService:
         req: AnthropicMessagesRequest,
         *,
         progress_callback: Optional[Callable[..., None]] = None,
+        raw_backend_mode: str = 'chunked_durable_compaction',
     ) -> tuple[str, Dict[str, Any]]:
         transcript_items, current_request = _inline_compaction_inputs(req)
         session_id = _inline_compaction_session_id(req, transcript_items, current_request)
@@ -346,7 +362,7 @@ class RoutingService:
         if progress_callback is not None:
             progress_callback('inline_render_completed', session_id=session_id)
         raw_backend = {
-            'mode': 'chunked_durable_compaction',
+            'mode': raw_backend_mode,
             'session_id': session_id,
             'current_request': current_request,
             'handoff': handoff,
@@ -358,6 +374,13 @@ class RoutingService:
             },
         }
         return rendered, raw_backend
+
+    def _inline_compaction_response_model(self) -> str:
+        extractor = getattr(getattr(self, 'compaction_service', None), 'extractor', None)
+        model = getattr(extractor, 'model', None)
+        if isinstance(model, str) and model:
+            return model
+        return settings.compactor_model
 
     def invoke_from_anthropic(self, req: AnthropicMessagesRequest) -> Dict[str, Any]:
         transformed = anthropic_messages_to_prompt(req)
@@ -607,9 +630,12 @@ class RoutingService:
         session_id = metadata.get('compaction_session_id') or metadata.get('session_id')
         current_request = str(metadata.get('router_user_prompt') or prompt)
         if session_id:
-            flow = self.compaction_service.build_codex_handoff_flow(session_id, current_request=current_request)
-            if flow is not None:
-                return render_codex_support_prompt(flow, system=system, current_request=current_request)
+            try:
+                flow = self.compaction_service.build_codex_handoff_flow(session_id, current_request=current_request)
+                if flow is not None:
+                    return render_codex_support_prompt(flow, system=system, current_request=current_request)
+            except Exception:
+                logger.exception('failed to render compaction handoff for codex session %s', session_id)
         return f'{system}\n\n{prompt}'.strip()
 
 

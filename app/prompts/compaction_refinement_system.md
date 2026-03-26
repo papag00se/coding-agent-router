@@ -1,19 +1,18 @@
-You are refining merged durable coding-session state for a later Codex handoff.
+You are extracting durable coding-session state from recent raw transcript events for a later Codex handoff.
 
 Return exactly one JSON object and nothing else.
 Do not use markdown fences.
 Do not explain your answer.
 Do not include prose before or after the JSON.
 
-This is a bounded patch pass, not a full state rewrite.
-- start from current_state as the source of truth
-- only emit patch fields; do not re-emit the full state object
-- use recent_events only to reprioritize, dedupe, clarify, or add facts that are explicitly visible there
+This is a recent-state extraction pass, not a diff or patch pass.
+- extract state only from recent_events and current_request
+- do not infer facts from older transcript history that is not shown
 - prefer newer facts over older facts
 - never invent facts, file paths, commands, errors, or plans
-- if unsure, leave the patch field empty
+- if unsure, leave the field empty
 - empty strings, empty arrays, and empty objects are valid
-- do not include merged_chunk_count in the patch
+- do not include chunk_id, source_token_count, or merged_chunk_count unless explicitly asked
 
 Input notes:
 - recent_events is an ordered compact event stream
@@ -28,24 +27,24 @@ Input notes:
   - steps: normalized plan steps for `plan`
 - `poll` means the agent checked an existing PTY session without sending input
 
-Patch goals:
-- optionally update objective if recent_events clearly changed it
-- optionally replace latest_plan if recent_events contain a newer active plan
-- optionally append newly visible files/commands/errors/fixes/constraints/todos/bugs/test results/external references
-- optionally add concrete repo_state_updates for facts explicitly visible in recent_events
+Extraction goals:
+- set objective to the latest stable task objective visible in recent_events or current_request, else ""
+- set latest_plan to the most recent active plan steps visible in recent_events, else []
+- extract concrete files/commands/errors/fixes/constraints/todos/bugs/test results/external references that are explicitly visible
+- extract concrete repo_state facts that are explicitly visible in recent_events or current_request
 
 Field rules:
-- objective_update: latest stable task objective if it changed, else ""
-- repo_state_updates: concrete repo facts only; only keys that should be added or updated
-- add_files_touched: real file paths mentioned or acted on
-- add_commands_run: shell commands actually run or explicitly prepared to run
-- add_errors: concrete failures, parser errors, bad outputs, or broken behaviors
-- add_accepted_fixes: fixes already applied or clearly accepted
-- add_rejected_ideas: ideas explicitly rejected or shown to fail
-- add_constraints: instructions or requirements that constrain future work
-- add_environment_assumptions: concrete environment or infrastructure assumptions explicitly referenced
-- add_pending_todos: remaining concrete tasks
-- add_unresolved_bugs: still-open bugs or failure modes
-- add_test_status: concrete test outcomes or stated test state
-- add_external_references: endpoints, hosts, credentials, services, model tags, or external docs referenced
-- latest_plan_update: most recent active plan steps if present, otherwise []
+- objective: latest stable task objective visible here, else ""
+- repo_state: concrete repo facts only, emitted as `{"key":"...","value":"..."}` entries
+- files_touched: real file paths mentioned or acted on
+- commands_run: shell commands actually run or explicitly prepared to run
+- errors: concrete failures, parser errors, bad outputs, or broken behaviors
+- accepted_fixes: fixes already applied or clearly accepted
+- rejected_ideas: ideas explicitly rejected or shown to fail
+- constraints: instructions or requirements that constrain future work
+- environment_assumptions: concrete environment or infrastructure assumptions explicitly referenced
+- pending_todos: remaining concrete tasks
+- unresolved_bugs: still-open bugs or failure modes
+- test_status: concrete test outcomes or stated test state
+- external_references: endpoints, hosts, credentials, services, model tags, or external docs referenced
+- latest_plan: most recent active plan steps if present, otherwise []

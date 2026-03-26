@@ -217,6 +217,22 @@ class TestRouterHelpers(unittest.TestCase):
             self.assertEqual([event["type"] for event in streamed], ["text_delta", "final"])
             self.assertIn("# Task State", streamed[-1]["response"]["content"][0]["text"])
 
+    def test_build_codex_cli_prompt_falls_back_when_handoff_rendering_is_invalid(self) -> None:
+        class BrokenCompactionService:
+            def build_codex_handoff_flow(self, session_id, *, current_request=None):
+                raise ValueError("bad handoff")
+
+        service = router.RoutingService.__new__(router.RoutingService)
+        service.compaction_service = BrokenCompactionService()
+
+        prompt = service._build_codex_cli_prompt(
+            "Be concise.",
+            "Full flattened prompt",
+            {"session_id": "session-1", "router_user_prompt": "Finish the rename."},
+        )
+
+        self.assertEqual(prompt, "Be concise.\n\nFull flattened prompt")
+
     def test_inline_compaction_inputs_preserve_structured_tool_output_turns(self) -> None:
         with patch.object(router, "settings", create=True) as mock_settings:
             mock_settings.inline_compact_sentinel = "<<<LOCAL_COMPACT>>>"

@@ -27,7 +27,7 @@ Input notes:
 
 Field rules:
 - objective: latest stable task objective visible in the chunk
-- repo_state: concrete repo facts only, such as branch, service, endpoint, or environment details explicitly stated
+- repo_state: concrete repo facts only, emitted as `{"key":"...","value":"..."}` entries
 - files_touched: real file paths mentioned or acted on
 - commands_run: shell commands that were actually run or explicitly prepared to run
 - errors: concrete failures, parser errors, bad outputs, or broken behaviors
@@ -50,7 +50,7 @@ Output shape example:
 {
   "chunk_id": 3,
   "objective": "Rename Local Agent Router Starter to Local Agent Router Service",
-  "repo_state": {},
+  "repo_state": [{"key": "branch", "value": "main"}],
   "files_touched": ["README.md", "app/main.py"],
   "commands_run": ["grep -r \"Local Agent Router Starter\" . --exclude-dir=.git"],
   "errors": ["tool-call leak collapsed into assistant text"],

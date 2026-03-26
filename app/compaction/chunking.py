@@ -16,7 +16,7 @@ def chunk_transcript_items(
     if not items:
         return []
 
-    token_counts = [estimate_tokens(item) for item in items]
+    token_counts = [_item_token_count(item) for item in items]
     chunks: List[TranscriptChunk] = []
     start = 0
     chunk_id = 1
@@ -67,7 +67,7 @@ def chunk_transcript_items_by_prompt(
     if not items:
         return [], []
 
-    token_counts = [estimate_tokens(item) for item in items]
+    token_counts = [_item_token_count(item) for item in items]
     chunks: List[TranscriptChunk] = []
     skipped_items: List[Dict[str, Any]] = []
     start = 0
@@ -132,11 +132,21 @@ def split_recent_raw_turns(items: List[Dict[str, Any]], keep_tokens: int) -> Tup
     kept_tokens = 0
     split_index = len(items)
     for index in range(len(items) - 1, -1, -1):
-        kept_tokens += estimate_tokens(items[index])
+        item_tokens = _item_token_count(items[index])
+        if kept_tokens > 0 and kept_tokens + item_tokens > keep_tokens:
+            break
+        kept_tokens += item_tokens
         split_index = index
         if kept_tokens >= keep_tokens:
             break
     return items[:split_index], items[split_index:]
+
+
+def _item_token_count(item: Dict[str, Any]) -> int:
+    if not isinstance(item, dict):
+        return estimate_tokens(item)
+    compactable = {key: value for key, value in item.items() if not str(key).startswith('_compaction_')}
+    return estimate_tokens(compactable)
 
 
 def _next_start(token_counts: List[int], start: int, end: int, overlap_tokens: int) -> int:

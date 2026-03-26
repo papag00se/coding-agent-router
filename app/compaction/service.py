@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Dict, List, Optional
 
 from ..config import settings
@@ -7,7 +8,7 @@ from ..task_metrics import estimate_tokens
 from .chunking import chunk_transcript_items_by_prompt, split_recent_raw_turns
 from .durable_memory import build_session_handoff, render_durable_memory
 from .extractor import CompactionExtractor
-from .handoff import build_codex_handoff_flow
+from .handoff import build_codex_handoff_flow, validate_codex_handoff_flow
 from .merger import merge_states
 from .normalize import normalize_transcript_for_compaction
 from .models import CodexHandoffFlow, MergedState, SessionHandoff
@@ -16,6 +17,7 @@ from .refiner import CompactionRefiner
 from .storage import CompactionStorage
 
 _REFINEMENT_RECENT_RAW_TARGET_TOKENS = 8000
+logger = logging.getLogger(__name__)
 
 
 class CompactionService:
@@ -44,9 +46,11 @@ class CompactionService:
             progress_callback,
             'normalize_completed',
             compactable_count=len(normalized.compactable_items),
+            precompacted_count=len(normalized.precompacted_items),
             preserved_tail_count=len(normalized.preserved_tail),
         )
         compactable, recent_raw_turns = split_recent_raw_turns(normalized.compactable_items, settings.compactor_keep_raw_tokens)
+        recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, normalized.precompacted_items)
         recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, normalized.preserved_tail)
         extraction_prompt_limit = self._extraction_max_prompt_tokens()
         chunks, skipped_items = chunk_transcript_items_by_prompt(
@@ -99,6 +103,7 @@ class CompactionService:
             progress_callback=progress_callback,
         )
         final_recent_raw_turns = _merge_recent_raw_turns(recent_raw_turns, normalized.preserved_tail)
+        final_recent_raw_turns = [_strip_compaction_fields(item) for item in final_recent_raw_turns]
         memory = render_durable_memory(refined, final_recent_raw_turns, current_request)
         handoff = build_session_handoff(refined, final_recent_raw_turns, current_request)
         _emit_progress(progress_callback, 'render_completed')
@@ -111,14 +116,22 @@ class CompactionService:
         return handoff
 
     def load_latest_handoff(self, session_id: str) -> Optional[SessionHandoff]:
-        return self.storage.load_handoff(session_id)
+        try:
+            return self.storage.load_handoff(session_id)
+        except Exception:
+            logger.exception("failed to load compaction handoff for session %s", session_id)
+            return None
 
     def build_codex_handoff_flow(self, session_id: str, *, current_request: Optional[str] = None) -> Optional[CodexHandoffFlow]:
-        handoff = self.storage.load_handoff(session_id)
-        memory = self.storage.load_durable_memory(session_id)
-        if handoff is None or memory is None:
+        try:
+            handoff = self.storage.load_handoff(session_id)
+            memory = self.storage.load_durable_memory(session_id)
+            if handoff is None or memory is None:
+                return None
+            return validate_codex_handoff_flow(build_codex_handoff_flow(memory, handoff, current_request=current_request))
+        except Exception:
+            logger.exception("failed to build codex handoff flow for session %s", session_id)
             return None
-        return build_codex_handoff_flow(memory, handoff, current_request=current_request)
 
     def refresh_if_needed(
         self,
@@ -304,7 +317,20 @@ def _merge_recent_raw_turns(existing: List[Dict[str, Any]], preserved_tail: List
     for item in preserved_tail:
         if item not in merged:
             merged.append(item)
-    return merged
+    return sorted(merged, key=_compaction_sort_key)
+
+
+def _compaction_sort_key(item: Dict[str, Any]) -> tuple[int, str]:
+    index = item.get('_compaction_index') if isinstance(item, dict) else None
+    if isinstance(index, int):
+        return index, ''
+    return 1_000_000_000, str(item)
+
+
+def _strip_compaction_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        return item
+    return {key: value for key, value in item.items() if not str(key).startswith('_compaction_')}
 
 
 def _take_items_with_prompt_budget(

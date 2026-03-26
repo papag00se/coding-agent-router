@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app import compaction_main
+from app.transport_metrics import clear_transport_metrics_caches
 
 
 class _DummyRequest:
@@ -21,6 +24,18 @@ async def _collect_streaming_response(response) -> bytes:
 
 
 class TestCompactionMainHelpers(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._transport_log_path = Path(self._tmpdir.name) / "transport.jsonl"
+        self._transport_log_patcher = patch.object(compaction_main, "_TRANSPORT_LOG_PATH", self._transport_log_path)
+        self._transport_log_patcher.start()
+        clear_transport_metrics_caches()
+
+    def tearDown(self) -> None:
+        clear_transport_metrics_caches()
+        self._transport_log_patcher.stop()
+        self._tmpdir.cleanup()
+
     def test_sentinel_and_message_text_helpers_cover_edge_cases(self) -> None:
         with patch.object(compaction_main, "settings", create=True) as mock_settings:
             mock_settings.inline_compact_sentinel = "<<<LOCAL_COMPACT>>>"
@@ -259,8 +274,42 @@ class TestCompactionMainHelpers(unittest.TestCase):
         self.assertEqual(compaction_main._qualifying_spark_category(small_refactor_payload), "small_refactor")
         self.assertEqual(compaction_main._qualifying_spark_category(synthesis_payload), "simple_synthesis")
 
-    def test_spark_rewrite_respects_rate_and_context_limit(self) -> None:
-        payload = {
+    def test_mini_rewrite_classifier_covers_bounded_non_spark_shapes(self) -> None:
+        investigation_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_search",
+                    "output": "Command: /bin/bash -lc 'rg -n \"RouterDecision\" app/router.py tests/test_router.py docs/spec/routing.md app/models.py'\napp/router.py:154:class RoutingService\ntests/test_router.py:18:RouteDecision\ndocs/spec/routing.md:47:return JSON containing route, confidence, and reason.\napp/models.py:27:class RouteDecision\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Investigate the likely root cause across app/router.py, tests/test_router.py, docs/spec/routing.md, and app/models.py."}],
+                },
+            ],
+        }
+        analysis_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_diff",
+                    "output": "Command: /bin/bash -lc 'git diff -- app/router.py tests/test_router.py docs/spec/routing.md app/models.py'\ndiff --git a/app/router.py b/app/router.py\n--- a/app/router.py\n+++ b/app/router.py\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Summarize the changes and recommend next steps across app/router.py, tests/test_router.py, docs/spec/routing.md, and app/models.py."}],
+                },
+            ],
+        }
+        self.assertEqual(compaction_main._qualifying_mini_category(investigation_payload), "bounded_investigation")
+        self.assertEqual(compaction_main._qualifying_mini_category(analysis_payload), "cross_file_analysis")
+
+    def test_passthrough_model_rewrite_respects_spark_rate_and_sends_oversize_to_mini(self) -> None:
+        spark_payload = {
             "model": "gpt-5.4",
             "input": [
                 {
@@ -273,23 +322,168 @@ class TestCompactionMainHelpers(unittest.TestCase):
         with patch.object(compaction_main, "settings", create=True) as mock_settings:
             mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
             mock_settings.codex_spark_qualified_rate = 1.0
-            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_spark(payload)
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_model(spark_payload)
         self.assertEqual(rewritten["model"], "gpt-5.3-codex-spark")
         self.assertTrue(rewrite["applied"])
-        huge_payload = {
+        self.assertEqual(rewrite["rewrite_family"], "spark")
+        self.assertTrue(rewrite["spark"]["applied"])
+        investigation_payload = {
             "model": "gpt-5.4",
             "input": [
-                {"type": "function_call_output", "call_id": "call_9", "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n" + ("a" * 500_000)}
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_search",
+                    "output": "Command: /bin/bash -lc 'rg -n \"RouteDecision\" app/router.py tests/test_router.py docs/spec/routing.md app/models.py'\napp/router.py:154:class RoutingService\ntests/test_router.py:18:RouteDecision\ndocs/spec/routing.md:47:return JSON containing route, confidence, and reason.\napp/models.py:27:class RouteDecision\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Investigate the likely root cause across app/router.py, tests/test_router.py, docs/spec/routing.md, and app/models.py."}],
+                },
             ],
         }
         with patch.object(compaction_main, "settings", create=True) as mock_settings:
             mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
             mock_settings.codex_spark_qualified_rate = 1.0
-            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_spark(huge_payload)
-        self.assertEqual(rewritten["model"], "gpt-5.4")
-        self.assertFalse(rewrite["applied"])
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_model(investigation_payload)
+        self.assertEqual(rewritten["model"], "gpt-5.4-mini")
+        self.assertEqual(rewrite["rewrite_family"], "mini")
+        self.assertTrue(rewrite["spark"]["eligible"])
+        self.assertFalse(rewrite["spark"]["applied"])
+        huge_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_9",
+                    "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        with (
+            patch.object(compaction_main, "settings", create=True) as mock_settings,
+            patch.object(compaction_main, "estimate_openai_tokens", return_value=114_689),
+        ):
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_model(huge_payload)
+        self.assertEqual(rewritten["model"], "gpt-5.4-mini")
+        self.assertTrue(rewrite["applied"])
+        self.assertEqual(rewrite["rewrite_family"], "mini")
+        self.assertEqual(rewrite["mini"]["category"], "oversize_for_spark")
 
-    def test_spark_rewrite_uses_tokenizer_based_request_estimate(self) -> None:
+    def test_passthrough_model_rewrite_normalizes_gpt54_only_fields_for_spark(self) -> None:
+        payload = {
+            "model": "gpt-5.4",
+            "reasoning": {"effort": "none", "summary": "auto"},
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "Reading app/router.py"}],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Command: /bin/bash -lc \"sed -n '1,220p' app/router.py\"\nOutput:\nfrom app import router\n",
+                },
+            ],
+        }
+        with patch.object(compaction_main, "settings", create=True) as mock_settings:
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_model(payload)
+        self.assertEqual(rewritten["model"], "gpt-5.3-codex-spark")
+        self.assertEqual(rewritten["reasoning"]["effort"], "low")
+        self.assertEqual(rewritten["reasoning"]["summary"], "auto")
+        self.assertNotIn("phase", rewritten["input"][0])
+        self.assertEqual(payload["reasoning"]["effort"], "none")
+        self.assertEqual(payload["input"][0]["phase"], "commentary")
+        self.assertEqual(rewrite["rewrite_family"], "spark")
+
+    def test_passthrough_model_rewrite_blocks_spark_for_image_payloads_but_allows_mini(self) -> None:
+        spark_image_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_spark_image",
+                    "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Read this screenshot and tell me what it shows."},
+                        {"type": "input_image", "image_url": "https://example.test/screenshot.png"},
+                    ],
+                },
+            ],
+        }
+        mini_image_payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_mini_image",
+                    "output": "Command: /bin/bash -lc 'rg -n \"RouterDecision\" app/router.py tests/test_router.py docs/spec/routing.md app/models.py'\napp/router.py:154:class RoutingService\ntests/test_router.py:18:RouteDecision\ndocs/spec/routing.md:47:return JSON containing route, confidence, and reason.\napp/models.py:27:class RouteDecision\n",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Investigate the likely root cause across app/router.py, tests/test_router.py, docs/spec/routing.md, and app/models.py."},
+                        {"type": "input_image", "image_url": "https://example.test/chart.png"},
+                    ],
+                },
+            ],
+        }
+        with patch.object(compaction_main, "settings", create=True) as mock_settings:
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            spark_rewritten, spark_rewrite = compaction_main._rewrite_passthrough_payload_for_model(spark_image_payload)
+            mini_rewritten, mini_rewrite = compaction_main._rewrite_passthrough_payload_for_model(mini_image_payload)
+        self.assertIs(spark_rewritten, spark_image_payload)
+        self.assertEqual(spark_rewritten["model"], "gpt-5.4")
+        self.assertFalse(spark_rewrite["applied"])
+        self.assertTrue(spark_rewrite["image_inputs_present"])
+        self.assertFalse(spark_rewrite["spark"]["eligible"])
+        self.assertEqual(mini_rewritten["model"], "gpt-5.4-mini")
+        self.assertTrue(mini_rewrite["applied"])
+        self.assertEqual(mini_rewrite["rewrite_family"], "mini")
+        self.assertTrue(mini_rewrite["image_inputs_present"])
+
+    def test_passthrough_model_rewrite_rescues_direct_spark_image_requests_to_mini(self) -> None:
+        payload = {
+            "model": "gpt-5.3-codex-spark",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Read this screenshot and explain it."},
+                        {"type": "input_image", "image_url": "https://example.test/screenshot.png"},
+                    ],
+                }
+            ],
+        }
+        with patch.object(compaction_main, "settings", create=True) as mock_settings:
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_model(payload)
+        self.assertEqual(rewritten["model"], "gpt-5.4-mini")
+        self.assertEqual(rewrite["rewrite_family"], "mini")
+        self.assertTrue(rewrite["mini"]["image_spark_fallback_applied"])
+        self.assertTrue(rewrite["image_inputs_present"])
+
+    def test_passthrough_model_rewrite_uses_tokenizer_based_request_estimate(self) -> None:
         payload = {
             "model": "gpt-5.4",
             "input": [
@@ -306,12 +500,13 @@ class TestCompactionMainHelpers(unittest.TestCase):
         ):
             mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
             mock_settings.codex_spark_qualified_rate = 1.0
-            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_spark(payload)
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_model(payload)
         estimate_openai_tokens.assert_called_once_with(payload, model="gpt-5.4")
         self.assertEqual(rewritten["model"], "gpt-5.3-codex-spark")
         self.assertEqual(rewrite["request_tokens"], 99_999)
 
-    def test_spark_rewrite_allows_requests_at_cap(self) -> None:
+    def test_passthrough_model_rewrite_allows_requests_at_spark_cap(self) -> None:
         payload = {
             "model": "gpt-5.4",
             "input": [
@@ -328,10 +523,29 @@ class TestCompactionMainHelpers(unittest.TestCase):
         ):
             mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
             mock_settings.codex_spark_qualified_rate = 1.0
-            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_spark(payload)
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_model(payload)
         self.assertEqual(rewritten["model"], "gpt-5.3-codex-spark")
-        self.assertTrue(rewrite["eligible"])
-        self.assertTrue(rewrite["applied"])
+        self.assertTrue(rewrite["spark"]["eligible"])
+        self.assertTrue(rewrite["spark"]["applied"])
+
+    def test_passthrough_model_rewrite_does_not_rewrite_missing_model(self) -> None:
+        payload = {
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_8",
+                    "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        with patch.object(compaction_main, "settings", create=True) as mock_settings:
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_model(payload)
+        self.assertEqual(rewritten, payload)
+        self.assertFalse(rewrite["applied"])
 
     def test_direct_endpoint_helpers_cover_health_and_simple_wrappers(self) -> None:
         class DummyService:

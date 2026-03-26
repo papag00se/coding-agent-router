@@ -10,6 +10,8 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 
 from app import compaction_main
+from app.compaction.models import CodexHandoffFlow, SessionHandoff
+from app.transport_metrics import clear_transport_metrics_caches
 
 
 class DummyCompactionService:
@@ -59,6 +61,18 @@ class DummyInlineService(DummyCompactionService):
 
 
 class TestCompactionMain(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._transport_log_path = Path(self._tmpdir.name) / 'transport.jsonl'
+        self._transport_log_patcher = patch.object(compaction_main, '_TRANSPORT_LOG_PATH', self._transport_log_path)
+        self._transport_log_patcher.start()
+        clear_transport_metrics_caches()
+
+    def tearDown(self) -> None:
+        clear_transport_metrics_caches()
+        self._transport_log_patcher.stop()
+        self._tmpdir.cleanup()
+
     def test_responses_detects_inline_compaction_and_uses_local_service(self):
         service = DummyInlineService()
         with (
@@ -190,6 +204,183 @@ class TestCompactionMain(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(post.call_args.kwargs['json']['model'], 'gpt-5.3-codex-spark')
 
+    def test_internal_metrics_reports_passthrough_and_inline_counts(self):
+        service = DummyInlineService()
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.content = json.dumps({'object': 'response', 'output_text': 'upstream'}).encode('utf-8')
+        upstream.headers = {'content-type': 'application/json'}
+        upstream.close = Mock()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        settings.codex_spark_qualified_rate = 1.0
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / 'transport.jsonl'
+            with (
+                patch.object(compaction_main, 'service', service),
+                patch.object(compaction_main, 'inline_compaction_jobs', compaction_main.InlineCompactionJobManager(service)),
+                patch.object(compaction_main, '_TRANSPORT_LOG_PATH', log_path),
+                patch.object(compaction_main._UPSTREAM, 'post', return_value=upstream),
+                patch.object(compaction_main, 'settings', settings),
+            ):
+                client = TestClient(compaction_main.app)
+                passthrough = client.post(
+                    '/v1/responses',
+                    json={
+                        'model': 'gpt-5.4',
+                        'input': [
+                            {
+                                'type': 'function_call_output',
+                                'call_id': 'call_1',
+                                'output': "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                            }
+                        ],
+                    },
+                    headers={'Authorization': 'Bearer test-token'},
+                )
+                inline = client.post(
+                    '/v1/responses',
+                    json={
+                        'model': 'gpt-5.4',
+                        'instructions': '<<<LOCAL_COMPACT>>> Summarize the thread.',
+                        'input': [{'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Current thread'}]}],
+                    },
+                )
+                metrics = client.get('/internal/metrics')
+
+        self.assertEqual(passthrough.status_code, 200)
+        self.assertEqual(inline.status_code, 200)
+        self.assertEqual(metrics.status_code, 200)
+        body = metrics.json()
+        self.assertEqual(body['responses']['spark']['expected'], 1)
+        self.assertEqual(body['responses']['spark']['successful'], 1)
+        self.assertGreater(body['responses']['estimated_token_savings']['spark'], 0)
+        self.assertEqual(body['compaction']['detected'], 1)
+        self.assertEqual(body['compaction']['completed'], 1)
+        self.assertEqual(body['compaction']['completed_by_model']['qwen3.5-9b:iq4_xs'], 1)
+        self.assertGreater(body['compaction']['estimated_token_savings']['local'], 0)
+        self.assertEqual(body['paths']['/v1/responses']['passthrough_total'], 1)
+        self.assertEqual(body['paths']['/v1/responses']['inline_detected'], 1)
+        self.assertEqual(body['paths']['/v1/responses']['inline_completed'], 1)
+
+    def test_responses_passthrough_rewrites_bounded_investigation_requests_to_mini(self):
+        service = DummyInlineService()
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.content = json.dumps({'object': 'response', 'output_text': 'upstream'}).encode('utf-8')
+        upstream.headers = {'content-type': 'application/json'}
+        upstream.close = Mock()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        settings.codex_spark_qualified_rate = 1.0
+        settings.codex_mini_model = 'gpt-5.4-mini'
+        payload = {
+            'model': 'gpt-5.4',
+            'input': [
+                {
+                    'type': 'function_call_output',
+                    'call_id': 'call_search',
+                    'output': "Command: /bin/bash -lc 'rg -n \"RouteDecision\" app/router.py tests/test_router.py docs/spec/routing.md app/models.py'\napp/router.py:154:class RoutingService\ntests/test_router.py:18:RouteDecision\ndocs/spec/routing.md:47:return JSON containing route, confidence, and reason.\napp/models.py:27:class RouteDecision\n",
+                },
+                {
+                    'type': 'message',
+                    'role': 'user',
+                    'content': [{'type': 'input_text', 'text': 'Investigate the likely root cause across app/router.py, tests/test_router.py, docs/spec/routing.md, and app/models.py.'}],
+                },
+            ],
+        }
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(compaction_main._UPSTREAM, 'post', return_value=upstream) as post,
+            patch.object(compaction_main, 'settings', settings),
+        ):
+            client = TestClient(compaction_main.app)
+            response = client.post('/v1/responses', json=payload, headers={'Authorization': 'Bearer test-token'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(post.call_args.kwargs['json']['model'], 'gpt-5.4-mini')
+
+    def test_responses_passthrough_keeps_image_requests_on_original_model(self):
+        service = DummyInlineService()
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.content = json.dumps({'object': 'response', 'output_text': 'upstream'}).encode('utf-8')
+        upstream.headers = {'content-type': 'application/json'}
+        upstream.close = Mock()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        settings.codex_spark_qualified_rate = 1.0
+        settings.codex_mini_model = 'gpt-5.4-mini'
+        payload = {
+            'model': 'gpt-5.4',
+            'input': [
+                {
+                    'type': 'function_call_output',
+                    'call_id': 'call_1',
+                    'output': "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                },
+                {
+                    'type': 'message',
+                    'role': 'user',
+                    'content': [
+                        {'type': 'input_text', 'text': 'Read this screenshot and tell me what it shows.'},
+                        {'type': 'input_image', 'image_url': 'https://example.test/screenshot.png'},
+                    ],
+                },
+            ],
+        }
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(compaction_main._UPSTREAM, 'post', return_value=upstream) as post,
+            patch.object(compaction_main, 'settings', settings),
+        ):
+            client = TestClient(compaction_main.app)
+            response = client.post('/v1/responses', json=payload, headers={'Authorization': 'Bearer test-token'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['output_text'], 'upstream')
+        self.assertEqual(service.inline_requests, [])
+        self.assertEqual(post.call_args.args[0], 'https://chatgpt.com/backend-api/codex/responses')
+        self.assertEqual(post.call_args.kwargs['json']['model'], 'gpt-5.4')
+        self.assertEqual(post.call_args.kwargs['json']['input'][1]['content'][1]['type'], 'input_image')
+
+    def test_responses_passthrough_rewrites_direct_spark_image_requests_to_mini(self):
+        service = DummyInlineService()
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.content = json.dumps({'object': 'response', 'output_text': 'upstream'}).encode('utf-8')
+        upstream.headers = {'content-type': 'application/json'}
+        upstream.close = Mock()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        settings.codex_spark_qualified_rate = 1.0
+        settings.codex_mini_model = 'gpt-5.4-mini'
+        payload = {
+            'model': 'gpt-5.3-codex-spark',
+            'input': [
+                {
+                    'type': 'message',
+                    'role': 'user',
+                    'content': [
+                        {'type': 'input_text', 'text': 'Read this screenshot and explain it.'},
+                        {'type': 'input_image', 'image_url': 'https://example.test/screenshot.png'},
+                    ],
+                },
+            ],
+        }
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(compaction_main._UPSTREAM, 'post', return_value=upstream) as post,
+            patch.object(compaction_main, 'settings', settings),
+        ):
+            client = TestClient(compaction_main.app)
+            response = client.post('/v1/responses', json=payload, headers={'Authorization': 'Bearer test-token'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['output_text'], 'upstream')
+        self.assertEqual(post.call_args.kwargs['json']['model'], 'gpt-5.4-mini')
+        self.assertEqual(post.call_args.kwargs['json']['input'][0]['content'][1]['type'], 'input_image')
+
     def test_responses_stream_detects_inline_compaction_and_uses_local_service(self):
         service = DummyInlineService()
         with (
@@ -211,6 +402,142 @@ class TestCompactionMain(unittest.TestCase):
         self.assertIn('event: response.in_progress', response.text)
         self.assertIn('event: response.output_text.delta', response.text)
         self.assertIn('compact summary', response.text)
+
+    def test_responses_inline_compaction_falls_back_to_spark_on_local_failure(self):
+        class FailingInlineService(DummyCompactionService):
+            def stream_inline_compact_from_anthropic(self, req, *, progress_callback=None):
+                raise ValueError('bad handoff schema')
+
+        class SparkChunkedFallbackService:
+            def __init__(self) -> None:
+                self.compact_calls = []
+
+            def compact_transcript(self, session_id, items, *, current_request, repo_context=None, progress_callback=None):
+                self.compact_calls.append(
+                    {
+                        'session_id': session_id,
+                        'items': items,
+                        'current_request': current_request,
+                        'repo_context': repo_context,
+                    }
+                )
+                return SessionHandoff(
+                    stable_task_definition='spark compacted',
+                    current_request=current_request,
+                    recent_raw_turns=items[-1:],
+                )
+
+            def build_codex_handoff_flow(self, session_id, *, current_request=None):
+                return CodexHandoffFlow(
+                    durable_memory=[{'name': 'TASK_STATE.md', 'content': '# Task State\n- spark compacted\n'}],
+                    structured_handoff={'stable_task_definition': 'spark compacted'},
+                    recent_raw_turns=[{'role': 'user', 'content': 'Current thread'}],
+                    current_request=current_request or '',
+                )
+
+        service = FailingInlineService()
+        spark_service = SparkChunkedFallbackService()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(
+                compaction_main,
+                'inline_compaction_jobs',
+                compaction_main.InlineCompactionJobManager(
+                    service,
+                    fallback_callback=compaction_main._stream_spark_inline_compaction_fallback,
+                ),
+            ),
+            patch.object(compaction_main, '_build_spark_chunked_compaction_service', return_value=spark_service) as build_fallback,
+            patch.object(compaction_main, 'settings', settings),
+        ):
+            client = TestClient(compaction_main.app)
+            response = client.post(
+                '/v1/responses',
+                json={
+                    'model': 'gpt-5.4',
+                    'instructions': '<<<LOCAL_COMPACT>>> Summarize the thread.',
+                    'input': [{'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Current thread'}]}],
+                },
+                headers={'Authorization': 'Bearer test-token'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('spark compacted', response.json()['output_text'])
+        self.assertEqual(build_fallback.call_args.args[0]['authorization'], 'Bearer test-token')
+        self.assertEqual(spark_service.compact_calls[0]['current_request'], 'Current thread')
+
+    def test_responses_stream_inline_compaction_falls_back_to_spark_on_local_failure(self):
+        class FailingInlineService(DummyCompactionService):
+            def stream_inline_compact_from_anthropic(self, req, *, progress_callback=None):
+                if progress_callback is not None:
+                    progress_callback('normalize_completed', compactable_count=1, preserved_tail_count=0)
+                raise ValueError('bad handoff schema')
+
+        class SparkChunkedFallbackService:
+            def __init__(self) -> None:
+                self.compact_calls = []
+
+            def compact_transcript(self, session_id, items, *, current_request, repo_context=None, progress_callback=None):
+                self.compact_calls.append(
+                    {
+                        'session_id': session_id,
+                        'items': items,
+                        'current_request': current_request,
+                        'repo_context': repo_context,
+                    }
+                )
+                if progress_callback is not None:
+                    progress_callback('render_completed', session_id=session_id)
+                return SessionHandoff(
+                    stable_task_definition='spark compacted',
+                    current_request=current_request,
+                    recent_raw_turns=items[-1:],
+                )
+
+            def build_codex_handoff_flow(self, session_id, *, current_request=None):
+                return CodexHandoffFlow(
+                    durable_memory=[{'name': 'TASK_STATE.md', 'content': '# Task State\n- spark compacted\n'}],
+                    structured_handoff={'stable_task_definition': 'spark compacted'},
+                    recent_raw_turns=[{'role': 'user', 'content': 'Current thread'}],
+                    current_request=current_request or '',
+                )
+
+        service = FailingInlineService()
+        spark_service = SparkChunkedFallbackService()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(
+                compaction_main,
+                'inline_compaction_jobs',
+                compaction_main.InlineCompactionJobManager(
+                    service,
+                    fallback_callback=compaction_main._stream_spark_inline_compaction_fallback,
+                ),
+            ),
+            patch.object(compaction_main, '_build_spark_chunked_compaction_service', return_value=spark_service) as build_fallback,
+            patch.object(compaction_main, 'settings', settings),
+        ):
+            client = TestClient(compaction_main.app)
+            response = client.post(
+                '/v1/responses',
+                json={
+                    'model': 'gpt-5.4',
+                    'instructions': '<<<LOCAL_COMPACT>>> Summarize the thread.',
+                    'input': [{'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Current thread'}]}],
+                    'stream': True,
+                },
+                headers={'Authorization': 'Bearer test-token'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('spark compacted', response.text)
+        self.assertNotIn('event: response.failed', response.text)
+        self.assertEqual(build_fallback.call_args.args[0]['authorization'], 'Bearer test-token')
+        self.assertEqual(spark_service.compact_calls[0]['current_request'], 'Current thread')
 
     def test_responses_reuses_inflight_inline_compaction_job(self):
         service = DummyInlineService()

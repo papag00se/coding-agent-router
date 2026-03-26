@@ -36,7 +36,7 @@ class OllamaClient:
         num_ctx: int,
         max_tokens: Optional[int] = None,
         system: Optional[str] = None,
-        response_format: Optional[str] = None,
+        response_format: Optional[Union[str, Dict[str, Any]]] = None,
         think: Optional[Union[bool, str]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
@@ -56,6 +56,8 @@ class OllamaClient:
             payload["messages"] = [{"role": "system", "content": system}] + payload["messages"]
         if response_format == "json":
             payload["format"] = "json"
+        elif isinstance(response_format, dict):
+            payload["format"] = response_format
         if think is not None:
             payload["think"] = think
         if tools:
@@ -78,7 +80,7 @@ class OllamaClient:
         num_ctx: int,
         max_tokens: Optional[int] = None,
         system: Optional[str] = None,
-        response_format: Optional[str] = None,
+        response_format: Optional[Union[str, Dict[str, Any]]] = None,
         think: Optional[Union[bool, str]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Iterator[Dict[str, Any]]:
@@ -98,6 +100,8 @@ class OllamaClient:
             payload["messages"] = [{"role": "system", "content": system}] + payload["messages"]
         if response_format == "json":
             payload["format"] = "json"
+        elif isinstance(response_format, dict):
+            payload["format"] = response_format
         if think is not None:
             payload["think"] = think
         if tools:

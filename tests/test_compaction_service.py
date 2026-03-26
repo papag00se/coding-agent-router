@@ -196,6 +196,33 @@ class TestCompactionService(unittest.TestCase):
         self.assertEqual(handoff.recent_raw_turns[-1]["content"][0]["type"], "tool_result")
         self.assertNotIn(handoff.recent_raw_turns[-1], extracted_items)
 
+    def test_compact_transcript_keeps_prior_machine_summary_raw_and_out_of_extractions(self):
+        extractor = _FakeExtractor()
+        refiner = _FakeRefiner()
+        machine_summary = (
+            "Another language model started to solve this problem and produced a summary of its thinking process.\n"
+            "Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n"
+            "## Thread Summary for Continuation\n\n"
+            "### Latest Real User Intent\nFix the deploy path.\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = CompactionService(extractor=extractor, refiner=refiner, storage=CompactionStorage(Path(tmpdir)))
+            handoff = service.compact_transcript(
+                "session-machine-summary",
+                [
+                    {"role": "assistant", "content": [{"type": "output_text", "text": machine_summary}]},
+                    {"role": "user", "content": "latest request"},
+                ],
+                current_request="latest request",
+            )
+
+            extracted_items = [item for chunk, _repo_context in extractor.calls for item in chunk.items]
+
+        self.assertEqual(extractor.calls, [])
+        self.assertEqual(handoff.recent_raw_turns[0]["content"][0]["text"], machine_summary)
+        self.assertEqual(refiner.calls[0]["recent_raw_turns"][0]["content"][0]["text"], machine_summary)
+        self.assertEqual(extracted_items, [])
+
     def test_compact_transcript_does_not_fallback_to_compacting_latest_oversize_item(self):
         extractor = _FakeExtractor()
         refiner = _FakeRefiner()
@@ -324,6 +351,9 @@ class TestCompactionService(unittest.TestCase):
                     compactor_overlap_tokens=0,
                     compactor_num_ctx=2000,
                 ),
+            ), patch(
+                "app.compaction.service.estimate_extraction_request_tokens",
+                return_value=700,
             ), patch(
                 "app.compaction.service.estimate_refinement_request_tokens",
                 side_effect=lambda state, recent_raw_turns, current_request, repo_context=None, model=None: (

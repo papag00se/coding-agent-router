@@ -47,6 +47,7 @@ Configuration is loaded from environment variables through [`app/config.py`](/ho
 - `LOG_COMPACTION_PAYLOADS`
 - `INLINE_COMPACT_SENTINEL`
 - `OPENAI_PASSTHROUGH_BASE_URL`
+- `CODEX_MINI_MODEL`
 - `CODEX_SPARK_MODEL`
 - `CODEX_SPARK_QUALIFIED_RATE`
 
@@ -65,6 +66,8 @@ These exist in config but are not operationally significant in the current runti
 
 `LOG_COMPACTION_PAYLOADS=true` adds full before and after compaction payloads to `state/compaction_transport.jsonl`. Leave it off unless you explicitly want raw payloads on disk.
 
+Transport and rewrite counters are persisted separately in `state/compaction_metrics.json`. Those counters are updated directly from runtime transport events, include estimated token-savings for Spark, mini, and local compaction paths, and continue to work even when `LOG_COMPACTION_PAYLOADS` is off. During bootstrap from older transport logs, local compaction savings are recovered from the intercepted `before_payload` when present; if an old completed local compaction cannot be paired back to a request, the bootstrap uses a `250000`-token default.
+
 `COMPACTOR_BURST_NUM_CTX` lets extractor and refiner requests temporarily raise context above the normal `COMPACTOR_NUM_CTX`. The default behavior keeps compaction at `16384` context but may expand a specific request to `17408` when the default window would leave too little room for valid JSON output.
 
 `COMPACTOR_TARGET_CHUNK_TOKENS` is the hard extraction chunk-content limit, not a soft target. The current default is `10000`.
@@ -75,7 +78,20 @@ These exist in config but are not operationally significant in the current runti
 
 Refinement also has a built-in per-iteration cap of about `8000` recent-raw tokens. That cap is code-level behavior, not an environment-variable knob.
 
+`CODEX_MINI_MODEL` is the upstream model id used when a non-compaction `/v1/responses` passthrough request is rewritten from `gpt-5.4` to the middle-tier mini lane.
+
+Mini selection is deterministic. The current policy rewrites `gpt-5.4` passthrough requests to `CODEX_MINI_MODEL` when either:
+
+- the tokenizer-based estimated request size is above the Spark cap of `114688`
+- the recent payload matches a bounded reasoning-heavy category such as bounded investigation, cross-file analysis, medium diff follow-up, medium test triage, or multi-file refactor
+
+Repo-wide or architecture-scale requests are intentionally left on full `gpt-5.4`.
+
 `CODEX_SPARK_MODEL` is the upstream model id used when a qualifying non-compaction `/v1/responses` passthrough request is rewritten from `gpt-5.4` to Spark.
+
+Spark rewrites are skipped for payloads that carry image inputs. If a request already targets `CODEX_SPARK_MODEL` and carries images, the proxy rewrites it to `CODEX_MINI_MODEL` instead.
+
+When a request is rewritten to `CODEX_SPARK_MODEL`, the proxy also normalizes request fields that are specific to newer GPT-5.4 payloads before forwarding the request to Spark. Today that includes stripping assistant-message `phase` markers and coercing unsupported reasoning-effort values onto Spark-supported settings.
 
 `CODEX_SPARK_QUALIFIED_RATE` controls the fraction of qualifying passthrough calls sent to Spark. Qualification currently requires:
 
@@ -96,3 +112,12 @@ Current Spark categories are:
 - `localized_edit`
 - `small_refactor`
 - `simple_synthesis`
+
+Current mini-only categories are:
+
+- `oversize_for_spark`
+- `bounded_investigation`
+- `cross_file_analysis`
+- `medium_diff_followup`
+- `medium_test_triage`
+- `multi_file_refactor`
