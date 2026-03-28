@@ -64,9 +64,11 @@ These exist in config but are not operationally significant in the current runti
 
 `OPENAI_PASSTHROUGH_BASE_URL` is the hosted Codex/OpenAI upstream for ordinary non-compaction traffic when the compaction companion is used as an OAuth proxy. In ChatGPT-auth mode, that should normally be `https://chatgpt.com/backend-api/codex`.
 
+Local Ollama requests are serialized per `base_url` by the client gate. `OLLAMA_POOL_CONNECTIONS` and `OLLAMA_POOL_MAXSIZE` only tune HTTP connection reuse.
+
 `LOG_COMPACTION_PAYLOADS=true` adds full before and after compaction payloads to `state/compaction_transport.jsonl`. Leave it off unless you explicitly want raw payloads on disk.
 
-Transport and rewrite counters are persisted separately in `state/compaction_metrics.json`. Those counters are updated directly from runtime transport events, include estimated token-savings for Spark, mini, and local compaction paths, and continue to work even when `LOG_COMPACTION_PAYLOADS` is off. During bootstrap from older transport logs, local compaction savings are recovered from the intercepted `before_payload` when present; if an old completed local compaction cannot be paired back to a request, the bootstrap uses a `250000`-token default.
+Transport and rewrite counters are persisted separately in `state/compaction_metrics.json`. Those counters are updated directly from runtime transport events, include estimated token-savings for Spark, mini, and local compaction paths, and continue to work even when `LOG_COMPACTION_PAYLOADS` is off. Spark rewrite stats also distinguish ordinary mini preemption from Spark quota blocks. During bootstrap from older transport logs, local compaction savings are recovered from the intercepted `before_payload` when present; if an old completed local compaction cannot be paired back to a request, the bootstrap uses a `250000`-token default.
 
 `COMPACTOR_BURST_NUM_CTX` lets extractor and refiner requests temporarily raise context above the normal `COMPACTOR_NUM_CTX`. The default behavior keeps compaction at `16384` context but may expand a specific request to `17408` when the default window would leave too little room for valid JSON output.
 
@@ -121,3 +123,5 @@ Current mini-only categories are:
 - `medium_diff_followup`
 - `medium_test_triage`
 - `multi_file_refactor`
+
+Spark quota exhaustion is handled by a persisted circuit breaker under `COMPACTION_STATE_DIR` at `spark_quota.json` (default `state/compaction/spark_quota.json`). When a Spark-targeted request gets a quota or rate-limit response, the companion records the reset hint if the upstream sends one, retries the same request on mini, and keeps subsequent Spark-targeted requests on mini until the recorded reset time expires. If the upstream does not send a reset hint, the breaker uses a short probe interval and backs off between failed probes. The next qualifying request after expiry re-probes Spark automatically. The same breaker is also consulted by inline compaction Spark fallback, which retries the chunked compaction pipeline on `CODEX_MINI_MODEL` when Spark is blocked or unavailable.

@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import json
+import time
 import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from app import compat
 from app import main
 
 
 class DummyService:
-    def __init__(self) -> None:
+    def __init__(self, delay_seconds: float = 0.0) -> None:
         self.request = None
+        self.delay_seconds = delay_seconds
 
     def invoke_from_anthropic(self, req):
         self.request = req.model_dump()
+        if self.delay_seconds:
+            time.sleep(self.delay_seconds)
         return {
             'id': 'msg_router_local',
             'type': 'message',
@@ -300,6 +305,19 @@ class TestCompatEndpoints(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('data: [DONE]', response.text)
 
+    def test_openai_chat_stream_emits_keepalive_before_done(self):
+        service = DummyService(delay_seconds=0.05)
+        with patch.object(main, 'service', service), patch.object(compat, '_SSE_KEEPALIVE_INTERVAL_SECONDS', 0.01):
+            client = TestClient(main.app)
+            response = client.post(
+                '/v1/chat/completions',
+                json={'model': 'router', 'messages': [{'role': 'user', 'content': 'Say ok'}], 'stream': True},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(': keepalive', response.text)
+        self.assertIn('data: [DONE]', response.text)
+
     def test_ollama_chat_stream_returns_ndjson(self):
         service = DummyService()
         with patch.object(main, 'service', service):
@@ -310,4 +328,21 @@ class TestCompatEndpoints(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(json.loads(response.text)['done'])
+        lines = [line for line in response.text.splitlines() if line.strip()]
+        self.assertTrue(lines)
+        self.assertTrue(json.loads(lines[-1])['done'])
+
+    def test_ollama_chat_stream_emits_blank_keepalive_before_ndjson(self):
+        service = DummyService(delay_seconds=0.05)
+        with patch.object(main, 'service', service), patch.object(compat, '_SSE_KEEPALIVE_INTERVAL_SECONDS', 0.01):
+            client = TestClient(main.app)
+            response = client.post(
+                '/api/chat',
+                json={'model': 'router', 'messages': [{'role': 'user', 'content': 'Say ok'}], 'stream': True},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.text.startswith('\n'))
+        lines = [line for line in response.text.splitlines() if line.strip()]
+        self.assertTrue(lines)
+        self.assertTrue(json.loads(lines[-1])['done'])

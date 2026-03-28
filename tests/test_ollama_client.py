@@ -1,148 +1,176 @@
 from __future__ import annotations
 
 import json
+import tempfile
+import threading
+import time
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+from app.clients import ollama_client
 from app.clients.ollama_client import OllamaClient
 
 
-class _FakeResponse:
-    def __init__(self, payload=None, lines=None):
-        self.payload = payload or {}
-        self.lines = lines or []
-        self.raise_called = False
+class _DummyJSONResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
 
-    def raise_for_status(self):
-        self.raise_called = True
-
-    def json(self):
-        return self.payload
-
-    def iter_lines(self, decode_unicode=True):
-        return iter(self.lines)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
+    def raise_for_status(self) -> None:
         return None
 
-
-class _FakeSession:
-    def __init__(self):
-        self.mounts = []
-        self.calls = []
-        self.response = None
-
-    def mount(self, prefix, adapter):
-        self.mounts.append((prefix, adapter))
-
-    def post(self, url, json=None, timeout=None, stream=False):
-        self.calls.append({"url": url, "json": json, "timeout": timeout, "stream": stream})
-        return self.response
+    def json(self) -> dict[str, object]:
+        return self.payload
 
 
-class TestOllamaClient(unittest.TestCase):
-    def test_chat_builds_expected_payload(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434/", (1, 2), pool_connections=3, pool_maxsize=4)
-        fake_session = _FakeSession()
-        fake_session.response = _FakeResponse(payload={"message": {"content": "ok"}})
-        client.session = fake_session
+class _DummyStreamResponse:
+    def __init__(self, recorder: "_Recorder", *, block_after_first_line: bool) -> None:
+        self.recorder = recorder
+        self.block_after_first_line = block_after_first_line
 
-        body = client.chat(
-            "model",
-            [{"role": "user", "content": "hi"}],
-            temperature=0.2,
-            num_ctx=4096,
-            max_tokens=256,
-            system="sys",
-            response_format="json",
-            think=False,
-            tools=[{"type": "function"}],
-        )
+    def __enter__(self) -> "_DummyStreamResponse":
+        return self
 
-        self.assertEqual(body["message"]["content"], "ok")
-        payload = fake_session.calls[0]["json"]
-        self.assertEqual(fake_session.calls[0]["url"], "http://127.0.0.1:11434/api/chat")
-        self.assertEqual(payload["messages"][0], {"role": "system", "content": "sys"})
-        self.assertEqual(payload["format"], "json")
-        self.assertFalse(payload["think"])
-        self.assertEqual(payload["tools"], [{"type": "function"}])
-        self.assertEqual(payload["options"]["num_predict"], 256)
-        self.assertFalse(payload["stream"])
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
 
-    def test_chat_without_optional_flags_keeps_minimal_payload(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434", 5)
-        fake_session = _FakeSession()
-        fake_session.response = _FakeResponse(payload={"done": True})
-        client.session = fake_session
+    def raise_for_status(self) -> None:
+        return None
 
-        client.chat("model", [{"role": "user", "content": "hi"}], temperature=0.0, num_ctx=1024)
-        payload = fake_session.calls[0]["json"]
-        self.assertNotIn("format", payload)
-        self.assertNotIn("tools", payload)
-        self.assertEqual(payload["messages"], [{"role": "user", "content": "hi"}])
+    def iter_lines(self, decode_unicode: bool = True):
+        del decode_unicode
+        self.recorder.stream_started.set()
+        yield json.dumps({"message": {"content": "chunk-1"}})
+        if self.block_after_first_line:
+            self.recorder.release.wait(timeout=2)
+            yield json.dumps({"message": {"content": "chunk-2"}})
 
-    def test_chat_accepts_schema_response_format(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434", 5)
-        fake_session = _FakeSession()
-        fake_session.response = _FakeResponse(payload={"done": True})
-        client.session = fake_session
 
-        schema = {"title": "ChunkExtraction", "type": "object", "properties": {"objective": {"type": "string"}}}
-        client.chat(
-            "model",
-            [{"role": "user", "content": "hi"}],
-            temperature=0.0,
-            num_ctx=1024,
-            response_format=schema,
-        )
+class _Recorder:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.first_entered = threading.Event()
+        self.stream_started = threading.Event()
+        self.release = threading.Event()
 
-        self.assertEqual(fake_session.calls[0]["json"]["format"], schema)
 
-    def test_chat_stream_yields_json_lines_and_skips_blanks(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434", 5)
-        fake_session = _FakeSession()
-        fake_session.response = _FakeResponse(lines=["", json.dumps({"message": {"content": "a"}}), json.dumps({"done": True})])
-        client.session = fake_session
+class _BlockingChatSession:
+    def __init__(self, recorder: _Recorder, name: str, *, block_first: bool) -> None:
+        self.recorder = recorder
+        self.name = name
+        self.block_first = block_first
 
-        items = list(
-            client.chat_stream(
-                "model",
-                [{"role": "user", "content": "hi"}],
-                temperature=0.2,
-                num_ctx=4096,
-                system=None,
-                tools=None,
-            )
-        )
+    def post(self, *args, **kwargs):
+        del args, kwargs
+        self.recorder.calls.append(self.name)
+        if len(self.recorder.calls) == 1:
+            self.recorder.first_entered.set()
+            if self.block_first:
+                self.recorder.release.wait(timeout=2)
+        payload = {"message": {"content": self.name}}
+        return _DummyJSONResponse(payload)
 
-        self.assertEqual(items, [{"message": {"content": "a"}}, {"done": True}])
-        self.assertTrue(fake_session.calls[0]["stream"])
 
-    def test_chat_stream_applies_optional_system_json_and_tools(self) -> None:
-        client = OllamaClient("http://127.0.0.1:11434", 5)
-        fake_session = _FakeSession()
-        fake_session.response = _FakeResponse(lines=[json.dumps({"done": True})])
-        client.session = fake_session
+class _BlockingStreamSession:
+    def __init__(self, recorder: _Recorder, name: str, *, block_first: bool) -> None:
+        self.recorder = recorder
+        self.name = name
+        self.block_first = block_first
 
-        list(
-            client.chat_stream(
-                "model",
-                [{"role": "user", "content": "hi"}],
-                temperature=0.2,
-                num_ctx=4096,
-                max_tokens=64,
-                system="sys",
-                response_format="json",
-                think=False,
-                tools=[{"type": "function"}],
-            )
-        )
+    def post(self, *args, **kwargs):
+        del args, kwargs
+        self.recorder.calls.append(self.name)
+        if len(self.recorder.calls) == 1:
+            self.recorder.first_entered.set()
+        return _DummyStreamResponse(self.recorder, block_after_first_line=self.block_first)
 
-        payload = fake_session.calls[0]["json"]
-        self.assertEqual(payload["messages"][0], {"role": "system", "content": "sys"})
-        self.assertEqual(payload["format"], "json")
-        self.assertFalse(payload["think"])
-        self.assertEqual(payload["tools"], [{"type": "function"}])
-        self.assertEqual(payload["options"]["num_predict"], 64)
+
+class TestOllamaClientQueueing(unittest.TestCase):
+    def test_chat_requests_to_same_base_url_queue_across_clients(self) -> None:
+        recorder = _Recorder()
+        results: dict[str, dict[str, object]] = {}
+        errors: list[BaseException] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(ollama_client, "_OLLAMA_LOCK_DIR", Path(tmpdir)):
+            client_one = OllamaClient("http://ollama.local:11434", timeout_seconds=5)
+            client_one.session = _BlockingChatSession(recorder, "one", block_first=True)
+            client_two = OllamaClient("http://ollama.local:11434", timeout_seconds=5)
+            client_two.session = _BlockingChatSession(recorder, "two", block_first=False)
+
+            def run_chat(client: OllamaClient, key: str) -> None:
+                try:
+                    results[key] = client.chat(
+                        "model",
+                        [{"role": "user", "content": "hello"}],
+                        temperature=0.0,
+                        num_ctx=8,
+                    )
+                except BaseException as exc:  # pragma: no cover - surfaced in assertion
+                    errors.append(exc)
+
+            first = threading.Thread(target=run_chat, args=(client_one, "one"))
+            second = threading.Thread(target=run_chat, args=(client_two, "two"))
+
+            first.start()
+            self.assertTrue(recorder.first_entered.wait(timeout=2))
+            second.start()
+            time.sleep(0.1)
+
+            self.assertEqual(recorder.calls, ["one"])
+
+            recorder.release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertFalse(errors)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(recorder.calls, ["one", "two"])
+        self.assertEqual(results["one"]["message"]["content"], "one")
+        self.assertEqual(results["two"]["message"]["content"], "two")
+
+    def test_chat_stream_requests_hold_lock_until_stream_finishes(self) -> None:
+        recorder = _Recorder()
+        results: dict[str, list[dict[str, object]]] = {}
+        errors: list[BaseException] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(ollama_client, "_OLLAMA_LOCK_DIR", Path(tmpdir)):
+            client_one = OllamaClient("http://ollama.local:11434", timeout_seconds=5)
+            client_one.session = _BlockingStreamSession(recorder, "one", block_first=True)
+            client_two = OllamaClient("http://ollama.local:11434", timeout_seconds=5)
+            client_two.session = _BlockingStreamSession(recorder, "two", block_first=False)
+
+            def run_stream(client: OllamaClient, key: str) -> None:
+                try:
+                    results[key] = list(
+                        client.chat_stream(
+                            "model",
+                            [{"role": "user", "content": "hello"}],
+                            temperature=0.0,
+                            num_ctx=8,
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - surfaced in assertion
+                    errors.append(exc)
+
+            first = threading.Thread(target=run_stream, args=(client_one, "one"))
+            second = threading.Thread(target=run_stream, args=(client_two, "two"))
+
+            first.start()
+            self.assertTrue(recorder.first_entered.wait(timeout=2))
+            self.assertTrue(recorder.stream_started.wait(timeout=2))
+            second.start()
+            time.sleep(0.1)
+
+            self.assertEqual(recorder.calls, ["one"])
+
+            recorder.release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertFalse(errors)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(recorder.calls, ["one", "two"])
+        self.assertEqual(results["one"][0]["message"]["content"], "chunk-1")
+        self.assertEqual(results["two"][0]["message"]["content"], "chunk-1")

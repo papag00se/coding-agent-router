@@ -48,7 +48,7 @@ Returns an OpenAI Chat Completions payload with:
 - optional function tool calls
 - usage from backend token counts
 
-Streaming is synthesized from a completed response rather than backed by progressive token generation.
+Streaming is synthesized from a completed response rather than backed by progressive token generation, and the stream emits keepalive comments while waiting on the backend response.
 
 ### OpenAI Responses Output
 
@@ -59,11 +59,11 @@ Returns:
 - `output_text` prefixed with a route banner when route metadata exists
 - `parallel_tool_calls=true` when tool calls are present
 
-The full router's `/v1/responses` stream is the only fully progressive compatibility stream in the main service.
+The full router's `/v1/responses` stream is the only fully progressive compatibility stream in the main service. Its sibling `/v1/chat/completions` stream is synthesized from a completed response and uses keepalive comments while it waits.
 
 ### Ollama Output
 
-Returns assistant text, optional `tool_calls`, and Ollama-style usage fields. Stream mode emits NDJSON derived from a completed response.
+Returns assistant text, optional `tool_calls`, and Ollama-style usage fields. Stream mode emits NDJSON derived from a completed response and blank-line keepalives while it waits on the backend response.
 
 ## Tool Translation
 

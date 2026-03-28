@@ -189,6 +189,7 @@ def _default_state(log_path: Path, state_path: Path) -> Dict[str, Any]:
                 "failed": 0,
                 "skipped_sampling": 0,
                 "blocked_by_mini": 0,
+                "blocked_by_quota": 0,
                 "by_category": {},
             },
             "mini": {
@@ -209,6 +210,7 @@ def _default_state(log_path: Path, state_path: Path) -> Dict[str, Any]:
             "estimated_token_savings": {
                 "total": 0,
                 "spark": 0,
+                "mini": 0,
                 "local": 0,
             },
             "started_by_model": {},
@@ -419,6 +421,7 @@ def _apply_responses_passthrough(state: Dict[str, Any], payload: Dict[str, Any],
     )
 
     spark = responses["spark"]
+    quota_blocked = bool(payload.get("spark_quota_blocked") or payload.get("spark_quota_fallback_applied"))
     if payload.get("spark_eligible"):
         spark["eligible"] += 1
     if payload.get("spark_rewrite_applied"):
@@ -435,6 +438,8 @@ def _apply_responses_passthrough(state: Dict[str, Any], payload: Dict[str, Any],
             )
         else:
             spark["failed"] += 1
+    elif quota_blocked:
+        spark["blocked_by_quota"] += 1
     elif payload.get("spark_eligible") and payload.get("mini_rewrite_applied"):
         spark["blocked_by_mini"] += 1
     elif payload.get("spark_eligible"):
@@ -663,9 +668,13 @@ def _inline_compaction_completion_family(payload: Dict[str, Any]) -> str:
             mode = str(raw_backend.get("mode") or "")
             if "spark" in mode:
                 return "spark"
+            if "mini" in mode:
+                return "mini"
         model = str(after_payload.get("model") or "")
         if model == settings.codex_spark_model:
             return "spark"
+        if model == settings.codex_mini_model:
+            return "mini"
     return "local"
 
 

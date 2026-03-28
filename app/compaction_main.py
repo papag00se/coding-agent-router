@@ -29,6 +29,7 @@ from .config import settings
 from .inline_compaction_jobs import InlineCompactionJobManager, inline_compaction_request_key
 from .models import CompactRequest, InvokeRequest
 from .router import RoutingService
+from .spark_quota import SparkQuotaState, is_spark_quota_error, spark_quota_state_path
 from .task_metrics import estimate_openai_tokens, estimate_tokens
 from .transport_metrics import transport_metrics_snapshot
 
@@ -37,6 +38,7 @@ service = RoutingService()
 inline_compaction_jobs = InlineCompactionJobManager(service)
 _TRANSPORT_LOG_PATH = Path('state/compaction_transport.jsonl')
 _UPSTREAM = requests.Session()
+_SPARK_QUOTA_STATE = SparkQuotaState(spark_quota_state_path(settings.compaction_state_dir))
 _SPARK_MAX_REQUEST_TOKENS = 114_688
 _MINI_MAX_FILE_REFS = 10
 _IMAGE_BLOCK_TYPES = {'image', 'input_image', 'localImage', 'local_image'}
@@ -212,7 +214,7 @@ def _payload_contains_image_input(payload: Dict[str, Any]) -> bool:
     return _walk(payload.get('input'))
 
 
-def _build_spark_chunked_compaction_service(headers: Dict[str, str]) -> CompactionService:
+def _build_chunked_compaction_service(headers: Dict[str, str], *, model: str) -> CompactionService:
     client = ResponsesClient(
         settings.openai_passthrough_base_url,
         (settings.ollama_connect_timeout_seconds, settings.codex_timeout_seconds),
@@ -223,13 +225,13 @@ def _build_spark_chunked_compaction_service(headers: Dict[str, str]) -> Compacti
     return CompactionService(
         extractor=CompactionExtractor(
             client=client,
-            model=settings.codex_spark_model,
+            model=model,
             temperature=settings.compactor_temperature,
             num_ctx=settings.compactor_num_ctx,
         ),
         refiner=CompactionRefiner(
             client=client,
-            model=settings.codex_spark_model,
+            model=model,
             temperature=settings.compactor_temperature,
             num_ctx=settings.compactor_num_ctx,
         ),
@@ -237,10 +239,20 @@ def _build_spark_chunked_compaction_service(headers: Dict[str, str]) -> Compacti
     )
 
 
+def _build_spark_chunked_compaction_service(headers: Dict[str, str]) -> CompactionService:
+    return _build_chunked_compaction_service(headers, model=settings.codex_spark_model)
+
+
+def _build_mini_chunked_compaction_service(headers: Dict[str, str]) -> CompactionService:
+    return _build_chunked_compaction_service(headers, model=settings.codex_mini_model)
+
+
 def _stream_chunked_inline_compaction_with_service(
     req: Any,
     compaction_service: CompactionService,
     *,
+    response_model: str | None = None,
+    raw_backend_mode: str = 'spark_chunked_durable_compaction',
     progress_callback=None,
 ):
     fallback_router = RoutingService.__new__(RoutingService)
@@ -249,8 +261,8 @@ def _stream_chunked_inline_compaction_with_service(
         fallback_router,
         req,
         progress_callback=progress_callback,
-        response_model=settings.codex_spark_model,
-        raw_backend_mode='spark_chunked_durable_compaction',
+        response_model=response_model or settings.codex_spark_model,
+        raw_backend_mode=raw_backend_mode,
     )
 
 
@@ -263,6 +275,7 @@ def _stream_spark_inline_compaction_fallback(
     request_key: str,
     progress_callback=None,
 ):
+    spark_quota_snapshot = _SPARK_QUOTA_STATE.snapshot()
     if progress_callback is not None:
         progress_callback('spark_fallback_started', model=settings.codex_spark_model, error=str(cause))
     _record_transport_event(
@@ -276,19 +289,93 @@ def _stream_spark_inline_compaction_fallback(
         request_tokens=_responses_request_tokens(payload),
         error=str(cause),
         mode='chunked',
+        spark_quota_blocked=bool(spark_quota_snapshot.get('blocked')),
+        spark_quota_remaining_seconds=spark_quota_snapshot.get('remaining_seconds', 0.0),
+        spark_quota_reset_at=spark_quota_snapshot.get('blocked_until'),
+        spark_quota_reason=spark_quota_snapshot.get('last_error_reason'),
+        spark_quota_last_status=spark_quota_snapshot.get('last_error_status'),
     )
+    if spark_quota_snapshot.get('blocked'):
+        if progress_callback is not None:
+            progress_callback('mini_fallback_started', model=settings.codex_mini_model, error='spark quota blocked')
+        mini_service = _build_mini_chunked_compaction_service(headers)
+        yield from _stream_chunked_inline_compaction_with_service(
+            _request,
+            mini_service,
+            progress_callback=progress_callback,
+            response_model=settings.codex_mini_model,
+            raw_backend_mode='mini_chunked_durable_compaction',
+        )
+        return
     spark_service = _build_spark_chunked_compaction_service(headers)
-    yield from _stream_chunked_inline_compaction_with_service(
-        _request,
-        spark_service,
-        progress_callback=progress_callback,
-    )
+    try:
+        yield from _stream_chunked_inline_compaction_with_service(
+            _request,
+            spark_service,
+            progress_callback=progress_callback,
+            response_model=settings.codex_spark_model,
+            raw_backend_mode='spark_chunked_durable_compaction',
+        )
+        return
+    except requests.RequestException as exc:
+        if not _spark_request_exception_requires_failover(exc):
+            raise
+        response = getattr(exc, 'response', None)
+        _SPARK_QUOTA_STATE.mark_exhausted(response, model=settings.codex_spark_model, error=str(exc))
+        if progress_callback is not None:
+            progress_callback('mini_fallback_started', model=settings.codex_mini_model, error=str(exc))
+        mini_service = _build_mini_chunked_compaction_service(headers)
+        yield from _stream_chunked_inline_compaction_with_service(
+            _request,
+            mini_service,
+            progress_callback=progress_callback,
+            response_model=settings.codex_mini_model,
+            raw_backend_mode='mini_chunked_durable_compaction',
+        )
 
 
 inline_compaction_jobs.fallback_callback = _stream_spark_inline_compaction_fallback
 
 
-def _rewrite_passthrough_payload_for_model(payload: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+def _upstream_response_to_starlette(upstream: requests.Response, *, stream: bool) -> Response:
+    if not stream or upstream.status_code >= 400:
+        body = upstream.content
+        media_type = upstream.headers.get('content-type')
+        upstream.close()
+        return Response(content=body, status_code=upstream.status_code, media_type=media_type)
+
+    def iterator():
+        try:
+            for chunk in upstream.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return StreamingResponse(iterator(), status_code=upstream.status_code, media_type=upstream.headers.get('content-type'))
+
+
+def _spark_response_requires_failover(response: requests.Response) -> bool:
+    status_code = getattr(response, 'status_code', 0)
+    try:
+        numeric_status = int(status_code)
+    except Exception:
+        numeric_status = 0
+    return numeric_status == 429 or numeric_status >= 500 or is_spark_quota_error(response)
+
+
+def _spark_request_exception_requires_failover(exc: requests.RequestException) -> bool:
+    response = getattr(exc, 'response', None)
+    if response is None:
+        return True
+    return _spark_response_requires_failover(response)
+
+
+def _rewrite_passthrough_payload_for_model(
+    payload: Dict[str, Any],
+    *,
+    force_mini_fallback: bool = False,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
     requested_model = payload.get('model')
     original_model = str(requested_model or 'gpt-5.4')
     request_tokens = estimate_openai_tokens(payload, model=original_model)
@@ -304,9 +391,15 @@ def _rewrite_passthrough_payload_for_model(payload: Dict[str, Any]) -> tuple[Dic
     )
     sample_value = _stable_sample_value(payload)
     mini_category = _qualifying_mini_category(payload, request_tokens=request_tokens)
+    spark_quota_snapshot = _SPARK_QUOTA_STATE.snapshot()
+    spark_targeted = spark_eligible or (requested_spark_model and not image_inputs_present)
+    spark_quota_blocked = spark_targeted and bool(spark_quota_snapshot.get('blocked'))
     mini_eligible = requested_gpt_54 and mini_category is not None
     image_spark_fallback_applied = requested_spark_model and image_inputs_present
-    mini_applied = mini_eligible or image_spark_fallback_applied
+    spark_quota_fallback_applied = bool(force_mini_fallback and spark_targeted)
+    if (spark_quota_blocked or spark_quota_fallback_applied) and mini_category is None:
+        mini_category = 'spark_quota_fallback'
+    mini_applied = mini_eligible or image_spark_fallback_applied or spark_quota_blocked or spark_quota_fallback_applied
     spark_applied = spark_eligible and not mini_applied and sample_value < settings.codex_spark_qualified_rate
 
     rewrite_family: str | None = None
@@ -329,6 +422,13 @@ def _rewrite_passthrough_payload_for_model(payload: Dict[str, Any]) -> tuple[Dic
         'target_model': target_model,
         'request_tokens': request_tokens,
         'image_inputs_present': image_inputs_present,
+        'spark_targeted': spark_targeted,
+        'spark_quota_blocked': spark_quota_blocked,
+        'spark_quota_fallback_applied': spark_quota_fallback_applied,
+        'spark_quota_remaining_seconds': spark_quota_snapshot.get('remaining_seconds', 0.0),
+        'spark_quota_reset_at': spark_quota_snapshot.get('blocked_until'),
+        'spark_quota_reason': spark_quota_snapshot.get('last_error_reason'),
+        'spark_quota_last_status': spark_quota_snapshot.get('last_error_status'),
         'spark': {
             'applied': spark_applied,
             'eligible': spark_eligible,
@@ -826,13 +926,50 @@ def _proxy_response(request: Request, path: str, payload: Dict[str, Any]) -> Res
     stream = bool(payload.get('stream'))
     url = _proxy_url(path)
     upstream_payload, rewrite = _rewrite_passthrough_payload_for_model(payload)
-    upstream = _UPSTREAM.post(
-        url,
-        json=upstream_payload,
-        headers=headers,
-        timeout=(settings.ollama_connect_timeout_seconds, settings.codex_timeout_seconds),
-        stream=stream,
-    )
+    upstream_error: requests.RequestException | None = None
+    try:
+        upstream = _UPSTREAM.post(
+            url,
+            json=upstream_payload,
+            headers=headers,
+            timeout=(settings.ollama_connect_timeout_seconds, settings.codex_timeout_seconds),
+            stream=stream,
+        )
+    except requests.RequestException as exc:
+        if upstream_payload.get('model') != settings.codex_spark_model or not _spark_request_exception_requires_failover(exc):
+            raise
+        upstream_error = exc
+        upstream = getattr(exc, 'response', None)
+    quota_retry: Dict[str, Any] | None = None
+    if upstream_payload.get('model') == settings.codex_spark_model and (
+        (upstream is not None and _spark_response_requires_failover(upstream))
+        or upstream_error is not None
+    ):
+        quota_retry = _SPARK_QUOTA_STATE.mark_exhausted(
+            upstream,
+            model=str(upstream_payload.get('model') or ''),
+            error=str(upstream_error) if upstream_error is not None else None,
+        )
+        if upstream is not None:
+            upstream.close()
+        fallback_payload, rewrite = _rewrite_passthrough_payload_for_model(payload, force_mini_fallback=True)
+        fallback_upstream = _UPSTREAM.post(
+            url,
+            json=fallback_payload,
+            headers=headers,
+            timeout=(settings.ollama_connect_timeout_seconds, settings.codex_timeout_seconds),
+            stream=stream,
+        )
+        quota_retry = {
+            **quota_retry,
+            'initial_status': upstream.status_code if upstream is not None else None,
+            'initial_model': upstream_payload.get('model'),
+            'initial_error': str(upstream_error) if upstream_error is not None else None,
+            'fallback_status': fallback_upstream.status_code,
+            'fallback_model': fallback_payload.get('model'),
+        }
+        upstream = fallback_upstream
+        upstream_payload = fallback_payload
     _record_transport_event(
         'responses_passthrough',
         path=path,
@@ -854,22 +991,23 @@ def _proxy_response(request: Request, path: str, payload: Dict[str, Any]) -> Res
         mini_rewrite_applied=rewrite['mini']['applied'],
         mini_eligible=rewrite['mini']['eligible'],
         mini_category=rewrite['mini']['category'],
+        spark_targeted=rewrite['spark_targeted'],
+        spark_quota_blocked=rewrite['spark_quota_blocked'],
+        spark_quota_remaining_seconds=rewrite['spark_quota_remaining_seconds'],
+        spark_quota_reset_at=rewrite['spark_quota_reset_at'],
+        spark_quota_reason=rewrite['spark_quota_reason'],
+        spark_quota_last_status=rewrite['spark_quota_last_status'],
+        spark_quota_fallback_applied=rewrite['spark_quota_fallback_applied'],
+        spark_quota_fallback_error=(quota_retry or {}).get('initial_error'),
+        spark_quota_fallback_status=(quota_retry or {}).get('initial_status'),
+        spark_quota_fallback_model=(quota_retry or {}).get('initial_model'),
+        spark_quota_fallback_retry_status=(quota_retry or {}).get('fallback_status'),
+        spark_quota_fallback_retry_model=(quota_retry or {}).get('fallback_model'),
     )
-    if not stream or upstream.status_code >= 400:
-        body = upstream.content
-        media_type = upstream.headers.get('content-type')
-        upstream.close()
-        return Response(content=body, status_code=upstream.status_code, media_type=media_type)
+    if upstream_payload.get('model') == settings.codex_spark_model and upstream.status_code < 400:
+        _SPARK_QUOTA_STATE.mark_success(model=str(upstream_payload.get('model') or ''))
 
-    def iterator():
-        try:
-            for chunk in upstream.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
-        finally:
-            upstream.close()
-
-    return StreamingResponse(iterator(), status_code=upstream.status_code, media_type=upstream.headers.get('content-type'))
+    return _upstream_response_to_starlette(upstream, stream=stream)
 
 
 @app.get("/health")

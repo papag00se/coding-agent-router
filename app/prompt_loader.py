@@ -17,11 +17,12 @@ def load_prompt(name: str) -> str:
 
 def render_prompt(name: str, replacements: Mapping[str, str] | None = None) -> str:
     text = load_prompt(name)
-    for key, value in (replacements or {}).items():
-        text = text.replace(f"{{{{{key}}}}}", value)
-
-    unresolved = sorted(set(_PLACEHOLDER_PATTERN.findall(text)))
+    replacements = replacements or {}
+    unresolved = sorted(set(_PLACEHOLDER_PATTERN.findall(text)) - set(replacements.keys()))
     if unresolved:
         raise ValueError(f"Unresolved prompt placeholders in {name}: {', '.join(unresolved)}")
+
+    for key, value in replacements.items():
+        text = text.replace(f"{{{{{key}}}}}", value)
 
     return text

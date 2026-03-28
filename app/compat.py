@@ -6,7 +6,7 @@ from queue import Empty, Queue
 from pathlib import Path
 from threading import Thread
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .models import AnthropicMessagesRequest
 from .router import flatten_content
@@ -450,6 +450,36 @@ def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
 
 def _sse_comment(comment: str) -> str:
     return f': {comment}\n\n'
+
+
+def iter_completed_response_with_keepalive(
+    result_factory: Callable[[], Dict[str, Any]],
+    response_iterator: Callable[[Dict[str, Any]], Iterator[str]],
+    *,
+    keepalive_chunk: str,
+) -> Iterator[str]:
+    event_queue: Queue[tuple[str, Any]] = Queue()
+
+    def _produce() -> None:
+        try:
+            event_queue.put(('result', result_factory()))
+        except BaseException as exc:
+            event_queue.put(('error', exc))
+
+    producer = Thread(target=_produce, daemon=True)
+    producer.start()
+
+    while True:
+        try:
+            queue_item_type, queue_item = event_queue.get(timeout=_SSE_KEEPALIVE_INTERVAL_SECONDS)
+        except Empty:
+            yield keepalive_chunk
+            continue
+
+        if queue_item_type == 'error':
+            raise queue_item
+        yield from response_iterator(queue_item)
+        return
 
 
 def iter_responses_response(response: Dict[str, Any], request: Optional[Dict[str, Any]] = None) -> Iterator[str]:

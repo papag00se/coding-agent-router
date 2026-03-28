@@ -11,6 +11,7 @@ from .compat import (
     anthropic_request_from_ollama_chat,
     anthropic_request_from_openai_chat,
     anthropic_request_from_responses,
+    iter_completed_response_with_keepalive,
     iter_ollama_chat_response,
     iter_openai_chat_response,
     iter_responses_progress,
@@ -138,9 +139,17 @@ def anthropic_messages(req: AnthropicMessagesRequest):
 
 @app.post("/v1/chat/completions")
 def openai_chat_completions(req: Dict[str, Any]):
-    response = service.invoke_from_anthropic(anthropic_request_from_openai_chat(req))
+    anthropic_request = anthropic_request_from_openai_chat(req)
     if req.get("stream"):
-        return StreamingResponse(iter_openai_chat_response(response), media_type="text/event-stream")
+        return StreamingResponse(
+            iter_completed_response_with_keepalive(
+                lambda: service.invoke_from_anthropic(anthropic_request),
+                iter_openai_chat_response,
+                keepalive_chunk=': keepalive\n\n',
+            ),
+            media_type="text/event-stream",
+        )
+    response = service.invoke_from_anthropic(anthropic_request)
     return JSONResponse(openai_chat_response(response))
 
 
@@ -157,7 +166,15 @@ def openai_responses(req: Dict[str, Any]):
 
 @app.post("/api/chat")
 def ollama_chat(req: Dict[str, Any]):
-    response = service.invoke_from_anthropic(anthropic_request_from_ollama_chat(req))
+    anthropic_request = anthropic_request_from_ollama_chat(req)
     if req.get("stream"):
-        return StreamingResponse(iter_ollama_chat_response(response), media_type="application/x-ndjson")
+        return StreamingResponse(
+            iter_completed_response_with_keepalive(
+                lambda: service.invoke_from_anthropic(anthropic_request),
+                iter_ollama_chat_response,
+                keepalive_chunk='\n',
+            ),
+            media_type="application/x-ndjson",
+        )
+    response = service.invoke_from_anthropic(anthropic_request)
     return JSONResponse(ollama_chat_response(response))

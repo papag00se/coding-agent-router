@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import requests
 from fastapi.testclient import TestClient
 
 from app import compaction_main
@@ -64,12 +65,17 @@ class TestCompactionMain(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         self._transport_log_path = Path(self._tmpdir.name) / 'transport.jsonl'
+        self._spark_quota_path = Path(self._tmpdir.name) / 'spark_quota.json'
         self._transport_log_patcher = patch.object(compaction_main, '_TRANSPORT_LOG_PATH', self._transport_log_path)
         self._transport_log_patcher.start()
+        self._spark_quota_state = compaction_main.SparkQuotaState(self._spark_quota_path)
+        self._spark_quota_patcher = patch.object(compaction_main, '_SPARK_QUOTA_STATE', self._spark_quota_state)
+        self._spark_quota_patcher.start()
         clear_transport_metrics_caches()
 
     def tearDown(self) -> None:
         clear_transport_metrics_caches()
+        self._spark_quota_patcher.stop()
         self._transport_log_patcher.stop()
         self._tmpdir.cleanup()
 
@@ -203,6 +209,93 @@ class TestCompactionMain(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(post.call_args.kwargs['json']['model'], 'gpt-5.3-codex-spark')
+
+    def test_responses_passthrough_retries_spark_quota_failures_on_mini(self):
+        service = DummyInlineService()
+        spark_upstream = Mock()
+        spark_upstream.status_code = 429
+        spark_upstream.content = json.dumps({'error': {'message': 'rate limited'}}).encode('utf-8')
+        spark_upstream.headers = {'content-type': 'application/json', 'Retry-After': '120'}
+        spark_upstream.close = Mock()
+        mini_upstream = Mock()
+        mini_upstream.status_code = 200
+        mini_upstream.content = json.dumps({'object': 'response', 'output_text': 'mini fallback'}).encode('utf-8')
+        mini_upstream.headers = {'content-type': 'application/json'}
+        mini_upstream.close = Mock()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        settings.codex_spark_qualified_rate = 1.0
+        settings.codex_mini_model = 'gpt-5.4-mini'
+        payload = {
+            'model': 'gpt-5.4',
+            'input': [
+                {
+                    'type': 'function_call_output',
+                    'call_id': 'call_1',
+                    'output': "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(compaction_main._UPSTREAM, 'post', side_effect=[spark_upstream, mini_upstream]) as post,
+            patch.object(compaction_main, 'settings', settings),
+        ):
+            client = TestClient(compaction_main.app)
+            response = client.post('/v1/responses', json=payload, headers={'Authorization': 'Bearer test-token'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['output_text'], 'mini fallback')
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[0].kwargs['json']['model'], 'gpt-5.3-codex-spark')
+        self.assertEqual(post.call_args_list[1].kwargs['json']['model'], 'gpt-5.4-mini')
+        metrics = compaction_main.transport_metrics_snapshot(self._transport_log_path)
+        self.assertEqual(metrics['responses']['spark']['blocked_by_quota'], 1)
+        self.assertEqual(metrics['responses']['mini']['expected'], 1)
+        self.assertEqual(metrics['responses']['mini']['successful'], 1)
+
+    def test_responses_passthrough_retries_spark_service_unavailable_failures_on_mini(self):
+        service = DummyInlineService()
+        spark_upstream = Mock()
+        spark_upstream.status_code = 503
+        spark_upstream.content = json.dumps({'error': {'message': 'service unavailable'}}).encode('utf-8')
+        spark_upstream.headers = {'content-type': 'application/json'}
+        spark_upstream.close = Mock()
+        mini_upstream = Mock()
+        mini_upstream.status_code = 200
+        mini_upstream.content = json.dumps({'object': 'response', 'output_text': 'mini fallback'}).encode('utf-8')
+        mini_upstream.headers = {'content-type': 'application/json'}
+        mini_upstream.close = Mock()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        settings.codex_spark_qualified_rate = 1.0
+        settings.codex_mini_model = 'gpt-5.4-mini'
+        payload = {
+            'model': 'gpt-5.4',
+            'input': [
+                {
+                    'type': 'function_call_output',
+                    'call_id': 'call_1',
+                    'output': "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(compaction_main._UPSTREAM, 'post', side_effect=[spark_upstream, mini_upstream]) as post,
+            patch.object(compaction_main, 'settings', settings),
+        ):
+            client = TestClient(compaction_main.app)
+            response = client.post('/v1/responses', json=payload, headers={'Authorization': 'Bearer test-token'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['output_text'], 'mini fallback')
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[0].kwargs['json']['model'], 'gpt-5.3-codex-spark')
+        self.assertEqual(post.call_args_list[1].kwargs['json']['model'], 'gpt-5.4-mini')
+        snapshot = self._spark_quota_state.snapshot()
+        self.assertTrue(snapshot['blocked'])
+        self.assertEqual(snapshot['last_error_status'], 503)
 
     def test_internal_metrics_reports_passthrough_and_inline_counts(self):
         service = DummyInlineService()
@@ -467,6 +560,72 @@ class TestCompactionMain(unittest.TestCase):
         self.assertIn('spark compacted', response.json()['output_text'])
         self.assertEqual(build_fallback.call_args.args[0]['authorization'], 'Bearer test-token')
         self.assertEqual(spark_service.compact_calls[0]['current_request'], 'Current thread')
+
+    def test_responses_inline_compaction_falls_back_to_mini_when_spark_is_unavailable(self):
+        class FailingInlineService(DummyCompactionService):
+            def stream_inline_compact_from_anthropic(self, req, *, progress_callback=None):
+                if progress_callback is not None:
+                    progress_callback('normalize_completed', compactable_count=1, preserved_tail_count=0)
+                raise ValueError('bad handoff schema')
+
+        class SparkDownService:
+            def compact_transcript(self, session_id, items, *, current_request, repo_context=None, progress_callback=None):
+                raise requests.ConnectionError('spark down')
+
+        class MiniChunkedService:
+            def compact_transcript(self, session_id, items, *, current_request, repo_context=None, progress_callback=None):
+                if progress_callback is not None:
+                    progress_callback('render_completed', session_id=session_id)
+                return SessionHandoff(
+                    stable_task_definition='mini compacted',
+                    current_request=current_request,
+                    recent_raw_turns=items[-1:],
+                )
+
+            def build_codex_handoff_flow(self, session_id, *, current_request=None):
+                return CodexHandoffFlow(
+                    durable_memory=[{'name': 'TASK_STATE.md', 'content': '# Task State\n- mini compacted\n'}],
+                    structured_handoff={'stable_task_definition': 'mini compacted'},
+                    recent_raw_turns=[{'role': 'user', 'content': 'Current thread'}],
+                    current_request=current_request or '',
+                )
+
+        service = FailingInlineService()
+        settings = SimpleNamespace(**compaction_main.settings.__dict__)
+        settings.codex_spark_model = 'gpt-5.3-codex-spark'
+        settings.codex_mini_model = 'gpt-5.4-mini'
+        with (
+            patch.object(compaction_main, 'service', service),
+            patch.object(
+                compaction_main,
+                'inline_compaction_jobs',
+                compaction_main.InlineCompactionJobManager(
+                    service,
+                    fallback_callback=compaction_main._stream_spark_inline_compaction_fallback,
+                ),
+            ),
+            patch.object(compaction_main, '_build_spark_chunked_compaction_service', return_value=SparkDownService()) as build_spark,
+            patch.object(compaction_main, '_build_mini_chunked_compaction_service', return_value=MiniChunkedService()) as build_mini,
+            patch.object(compaction_main, 'settings', settings),
+        ):
+            client = TestClient(compaction_main.app)
+            response = client.post(
+                '/v1/responses',
+                json={
+                    'model': 'gpt-5.4',
+                    'instructions': '<<<LOCAL_COMPACT>>> Summarize the thread.',
+                    'input': [{'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'Current thread'}]}],
+                },
+                headers={'Authorization': 'Bearer test-token'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('mini compacted', response.json()['output_text'])
+        self.assertEqual(build_spark.call_count, 1)
+        self.assertEqual(build_mini.call_count, 1)
+        snapshot = self._spark_quota_state.snapshot()
+        self.assertTrue(snapshot['blocked'])
+        self.assertEqual(snapshot['last_error_reason'], 'spark down')
 
     def test_responses_stream_inline_compaction_falls_back_to_spark_on_local_failure(self):
         class FailingInlineService(DummyCompactionService):

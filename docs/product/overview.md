@@ -17,10 +17,12 @@ Both share the same routing core in [`app/router.py`](/home/jesse/src/coding-age
 
 - Multi-protocol ingress for native `/invoke`, Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`, OpenAI `/v1/responses`, and Ollama `/api/chat`
 - Deterministic routing across `local_coder`, `local_reasoner`, and `codex_cli`
+- Local Ollama requests are serialized one at a time per service endpoint
 - Structured tool handling on the local coder lane
 - Durable transcript compaction with persisted handoff artifacts
 - Compaction companion mode that intercepts inline local compaction while proxying ordinary Responses traffic upstream
 - Selective passthrough rewrite from `gpt-5.4` to `gpt-5.3-codex-spark` or `gpt-5.4-mini` for qualifying non-compaction Responses calls, with image-bearing requests kept off the Spark lane
+- Spark quota failover to `gpt-5.4-mini` with automatic re-probe after the recorded reset time, including inline compaction Spark fallback
 
 ## Product Boundary
 

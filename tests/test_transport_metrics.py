@@ -134,6 +134,32 @@ class TestTransportMetrics(unittest.TestCase):
             self.assertEqual(snapshot["responses"]["by_upstream_model"]["gpt-5.4-mini"]["failed"], 1)
             self.assertEqual(snapshot["responses"]["estimated_token_savings"]["mini"], 0)
 
+    def test_record_transport_event_counts_spark_quota_blocks_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "transport.jsonl"
+            record_transport_event(
+                log_path,
+                "responses_passthrough",
+                path="/responses",
+                status=200,
+                upstream_model="gpt-5.4-mini",
+                request_tokens=330,
+                spark_eligible=True,
+                spark_rewrite_applied=False,
+                spark_quota_blocked=True,
+                spark_quota_fallback_applied=True,
+                mini_eligible=False,
+                mini_rewrite_applied=True,
+                mini_category="spark_quota_fallback",
+            )
+
+            snapshot = transport_metrics_snapshot(log_path)
+
+            self.assertEqual(snapshot["responses"]["spark"]["eligible"], 1)
+            self.assertEqual(snapshot["responses"]["spark"]["blocked_by_quota"], 1)
+            self.assertEqual(snapshot["responses"]["mini"]["expected"], 1)
+            self.assertEqual(snapshot["responses"]["mini"]["successful"], 1)
+
     def test_bootstrap_rebuilds_from_log_when_metrics_state_version_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "transport.jsonl"
@@ -227,6 +253,33 @@ class TestTransportMetrics(unittest.TestCase):
 
             self.assertEqual(snapshot["compaction"]["estimated_token_savings"]["local"], expected_tokens)
             self.assertEqual(snapshot["estimated_token_savings"]["local"], expected_tokens)
+
+    def test_bootstrap_counts_inline_mini_compaction_completion_as_mini(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "transport.jsonl"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "event": "inline_compaction_completed",
+                        "path": "/v1/responses",
+                        "request_key": "inline_job_1",
+                        "request_tokens": 330,
+                        "after_payload": {
+                            "model": "gpt-5.4-mini",
+                            "raw_backend": {"mode": "mini_chunked_durable_compaction"},
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = transport_metrics_snapshot(log_path)
+
+            self.assertEqual(snapshot["compaction"]["completed_by_mode"]["mini_chunked_durable_compaction"], 1)
+            self.assertEqual(snapshot["compaction"]["completed_by_model"]["gpt-5.4-mini"], 1)
+            self.assertEqual(snapshot["compaction"]["estimated_token_savings"]["mini"], 230)
+            self.assertEqual(snapshot["estimated_token_savings"]["mini"], 230)
 
     def test_bootstrap_uses_default_local_compaction_savings_when_unpaired(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

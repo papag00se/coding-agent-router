@@ -206,6 +206,8 @@ def _default_progress_message(stage: str, fields: Dict[str, Any]) -> str:
         return 'Finalizing compacted continuation.'
     if stage == 'spark_fallback_started':
         return 'Local compaction failed validation; retrying compaction with Spark.'
+    if stage == 'mini_fallback_started':
+        return 'Spark is unavailable; retrying compaction with mini.'
     return 'Local compaction in progress.'
 
 

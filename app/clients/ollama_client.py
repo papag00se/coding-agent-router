@@ -1,10 +1,34 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import fcntl
+
+
+_OLLAMA_LOCK_DIR = Path("state/ollama_locks")
+
+
+def _service_lock_path(base_url: str) -> Path:
+    digest = hashlib.sha256(base_url.rstrip("/").encode("utf-8")).hexdigest()
+    return _OLLAMA_LOCK_DIR / f"{digest}.lock"
+
+
+@contextmanager
+def _hold_service_lock(base_url: str):
+    lock_path = _service_lock_path(base_url)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class OllamaClient:
@@ -63,13 +87,14 @@ class OllamaClient:
         if tools:
             payload["tools"] = tools
 
-        response = self.session.post(
-            f"{self.base_url}/api/chat",
-            json=payload,
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        return response.json()
+        with _hold_service_lock(self.base_url):
+            response = self.session.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            return response.json()
 
     def chat_stream(
         self,
@@ -107,14 +132,15 @@ class OllamaClient:
         if tools:
             payload["tools"] = tools
 
-        with self.session.post(
-            f"{self.base_url}/api/chat",
-            json=payload,
-            timeout=self.timeout_seconds,
-            stream=True,
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
-                yield json.loads(line)
+        with _hold_service_lock(self.base_url):
+            with self.session.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                timeout=self.timeout_seconds,
+                stream=True,
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    yield json.loads(line)

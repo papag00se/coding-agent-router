@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from app.compaction.handoff import build_codex_handoff_flow, render_codex_support_prompt, render_inline_compaction_summary, validate_codex_handoff_flow
+from app.compaction.handoff import (
+    build_codex_handoff_flow,
+    render_codex_support_prompt,
+    render_compacted_flow,
+    render_inline_compaction_summary,
+    validate_codex_handoff_flow,
+)
 from app.compaction.models import CodexHandoffFlow, DurableMemorySet, SessionHandoff
 
 
@@ -59,6 +65,25 @@ class TestHandoffRendering(unittest.TestCase):
         prompt = render_codex_support_prompt(flow)
 
         self.assertEqual(prompt.count("Finish the rename."), 1)
+
+    def test_render_compacted_flow_preserves_literal_placeholder_like_content(self):
+        flow = CodexHandoffFlow(
+            durable_memory=[
+                {
+                    "name": "TASK_STATE.md",
+                    "content": "<button data-template-apply=\"{{ID}}\">Apply</button>\n<div>{{NAME}}</div>\n<span>{{SCOPE}}</span>\n",
+                },
+            ],
+            structured_handoff={"stable_task_definition": "rename service"},
+            recent_raw_turns=[{"role": "user", "content": "old turn"}],
+            current_request="Finish the rename.",
+        )
+
+        prompt = render_compacted_flow(flow, current_request="Finish the rename.")
+
+        self.assertIn("{{ID}}", prompt)
+        self.assertIn("{{NAME}}", prompt)
+        self.assertIn("{{SCOPE}}", prompt)
 
     def test_build_codex_handoff_flow_strips_legacy_current_request_section(self):
         flow = build_codex_handoff_flow(

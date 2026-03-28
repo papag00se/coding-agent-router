@@ -14,6 +14,8 @@ Primary components:
 6. Transcript compaction subsystem under [`app/compaction/`](/home/jesse/src/coding-agent-router/app/compaction)
 7. Prompt loading and rendering in [`app/prompt_loader.py`](/home/jesse/src/coding-agent-router/app/prompt_loader.py)
 
+`OllamaClient` serializes in-flight calls per `base_url` with a shared file lock, so router and compaction processes queue behind the same local Ollama service instead of hitting it concurrently.
+
 ## High-Level Flow
 
 ```text
@@ -35,6 +37,7 @@ Used when the service terminates client traffic and executes locally.
 Used when inline local compaction should run locally while ordinary `/v1/responses` traffic is proxied upstream.
 
 The compaction companion also owns the selective Spark and mini passthrough rewrite for qualifying non-compaction Responses requests.
+Inline compaction uses the same Spark breaker and can drop to mini when the Spark lane is blocked or unavailable.
 
 ## Prompt Files
 
@@ -44,3 +47,5 @@ Static prompt files include router, coder, reasoner, and compactor instructions.
 
 - [`codex_support_prompt.md`](/home/jesse/src/coding-agent-router/app/prompts/codex_support_prompt.md)
 - [`compacted_flow.md`](/home/jesse/src/coding-agent-router/app/prompts/compacted_flow.md)
+
+`render_prompt` validates only placeholders that exist in the template itself. Literal `{{...}}` sequences inside replacement content are preserved as plain text, which keeps code snippets and handoff payloads from tripping template validation.

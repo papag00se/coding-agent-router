@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -27,12 +28,17 @@ class TestCompactionMainHelpers(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         self._transport_log_path = Path(self._tmpdir.name) / "transport.jsonl"
+        self._spark_quota_path = Path(self._tmpdir.name) / "spark_quota.json"
         self._transport_log_patcher = patch.object(compaction_main, "_TRANSPORT_LOG_PATH", self._transport_log_path)
         self._transport_log_patcher.start()
+        self._spark_quota_state = compaction_main.SparkQuotaState(self._spark_quota_path)
+        self._spark_quota_patcher = patch.object(compaction_main, "_SPARK_QUOTA_STATE", self._spark_quota_state)
+        self._spark_quota_patcher.start()
         clear_transport_metrics_caches()
 
     def tearDown(self) -> None:
         clear_transport_metrics_caches()
+        self._spark_quota_patcher.stop()
         self._transport_log_patcher.stop()
         self._tmpdir.cleanup()
 
@@ -274,6 +280,36 @@ class TestCompactionMainHelpers(unittest.TestCase):
         self.assertEqual(compaction_main._qualifying_spark_category(small_refactor_payload), "small_refactor")
         self.assertEqual(compaction_main._qualifying_spark_category(synthesis_payload), "simple_synthesis")
 
+    def test_spark_quota_state_blocks_until_reset_and_then_reopens(self) -> None:
+        response = Mock()
+        response.status_code = 429
+        response.headers = {"Retry-After": "120"}
+        response.content = json.dumps({"error": {"message": "rate limited"}}).encode("utf-8")
+
+        snapshot = self._spark_quota_state.mark_exhausted(response, model="gpt-5.3-codex-spark", now=100.0)
+
+        self.assertTrue(snapshot["blocked"])
+        self.assertEqual(snapshot["last_error_status"], 429)
+        self.assertEqual(snapshot["last_error_model"], "gpt-5.3-codex-spark")
+        self.assertEqual(snapshot["last_error_reason"], "retry-after")
+        self.assertEqual(snapshot["blocked_until"], 220.0)
+        self.assertTrue(self._spark_quota_state.is_blocked(now=150.0))
+        self.assertFalse(self._spark_quota_state.is_blocked(now=221.0))
+        self.assertFalse(self._spark_quota_state.snapshot(now=221.0)["blocked"])
+
+    def test_spark_quota_state_blocks_without_http_response(self) -> None:
+        snapshot = self._spark_quota_state.mark_exhausted(
+            None,
+            model="gpt-5.3-codex-spark",
+            now=100.0,
+            error="spark down",
+        )
+
+        self.assertTrue(snapshot["blocked"])
+        self.assertIsNone(snapshot["last_error_status"])
+        self.assertEqual(snapshot["last_error_reason"], "spark down")
+        self.assertEqual(snapshot["last_error_preview"], "spark down")
+
     def test_mini_rewrite_classifier_covers_bounded_non_spark_shapes(self) -> None:
         investigation_payload = {
             "model": "gpt-5.4",
@@ -505,6 +541,35 @@ class TestCompactionMainHelpers(unittest.TestCase):
         estimate_openai_tokens.assert_called_once_with(payload, model="gpt-5.4")
         self.assertEqual(rewritten["model"], "gpt-5.3-codex-spark")
         self.assertEqual(rewrite["request_tokens"], 99_999)
+
+    def test_passthrough_model_rewrite_falls_back_to_mini_when_spark_is_blocked(self) -> None:
+        response = Mock()
+        response.status_code = 429
+        response.headers = {"Retry-After": "3600"}
+        response.content = b'{"error":{"message":"rate limited"}}'
+        self._spark_quota_state.mark_exhausted(response, model="gpt-5.3-codex-spark", now=time.time())
+
+        payload = {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "Command: /bin/bash -lc 'rg --files .'\nOutput:\n./app/router.py\n",
+                }
+            ],
+        }
+        with patch.object(compaction_main, "settings", create=True) as mock_settings:
+            mock_settings.codex_spark_model = "gpt-5.3-codex-spark"
+            mock_settings.codex_spark_qualified_rate = 1.0
+            mock_settings.codex_mini_model = "gpt-5.4-mini"
+            rewritten, rewrite = compaction_main._rewrite_passthrough_payload_for_model(payload)
+        self.assertEqual(rewritten["model"], "gpt-5.4-mini")
+        self.assertTrue(rewrite["spark_targeted"])
+        self.assertTrue(rewrite["spark_quota_blocked"])
+        self.assertFalse(rewrite["spark"]["applied"])
+        self.assertTrue(rewrite["mini"]["applied"])
+        self.assertEqual(rewrite["mini"]["category"], "spark_quota_fallback")
 
     def test_passthrough_model_rewrite_allows_requests_at_spark_cap(self) -> None:
         payload = {

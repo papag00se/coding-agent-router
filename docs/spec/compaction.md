@@ -104,7 +104,7 @@ Prompt source:
 
 ## Spark Fallback
 
-If local inline compaction fails or the rendered Codex handoff is invalid, the companion reruns compaction on `CODEX_SPARK_MODEL` through the same chunked extraction and refinement pipeline. Spark therefore sees the same compact event-stream chunks and bounded refinement windows as the local compactor, not the full original inline-compaction request replayed as one upstream call. The Spark compaction client uses the upstream streaming `/responses` contract and reconstructs the final completed response from SSE events.
+If local inline compaction fails or the rendered Codex handoff is invalid, the companion reruns compaction on `CODEX_SPARK_MODEL` through the same chunked extraction and refinement pipeline. If Spark is quota-blocked or unavailable, the same breaker state is recorded and the companion retries that same pipeline on `CODEX_MINI_MODEL` instead of failing the request. Spark and mini therefore see the same compact event-stream chunks and bounded refinement windows as the local compactor, not the full original inline-compaction request replayed as one upstream call. The Spark/mini compaction client uses the upstream streaming `/responses` contract and reconstructs the final completed response from SSE events.
 
 ## Persistence
 
