@@ -7,6 +7,7 @@ from unittest import mock
 from app.compaction.models import MergedState
 from app.compaction.prompts import REFINEMENT_SYSTEM_PROMPT, build_refinement_payload
 from app.compaction.refiner import CompactionRefiner
+from app.compaction.prompts import estimate_refinement_request_tokens
 
 
 class _FakeClient:
@@ -67,6 +68,24 @@ class TestCompactionRefiner(unittest.TestCase):
         self.assertEqual(refiner._response_token_budget(14336), 1792)
         self.assertEqual(refiner._response_token_budget(15000), 1128)
         self.assertEqual(refiner._response_token_budget(17000), 0)
+
+    def test_refine_state_token_estimation_counts_structured_response_schema(self):
+        with mock.patch("app.compaction.prompts.estimate_model_tokens", return_value=123) as estimate_model_tokens:
+            estimate_refinement_request_tokens(
+                MergedState(objective="fix"),
+                [{"role": "user", "content": "newer request"}],
+                current_request="newer request",
+                repo_context={"repo": "coding-agent-router"},
+                model="qwen-test",
+            )
+
+        request = estimate_model_tokens.call_args.args[0]
+        self.assertEqual(request["model"], "qwen-test")
+        self.assertEqual(request["instructions"], REFINEMENT_SYSTEM_PROMPT)
+        self.assertEqual(request["store"], False)
+        self.assertTrue(request["stream"])
+        self.assertEqual(request["text"]["format"]["schema"]["title"], "RecentStateExtraction")
+        self.assertIn("recent_events", request["input"][0]["content"][0]["text"])
 
     def test_refine_state_uses_burst_context_when_default_window_would_starve_output(self):
         client = _FakeClient('{"objective":"ok"}')

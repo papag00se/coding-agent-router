@@ -788,6 +788,183 @@ def iter_responses_progress(events: Iterable[Dict[str, Any]], request: Optional[
         raise RuntimeError('unexpected event type in iter_responses_progress')
 
 
+def anthropic_messages_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip internal fields to produce standard Anthropic Messages API response."""
+    return {
+        'id': response.get('id', 'msg_router_local'),
+        'type': 'message',
+        'role': 'assistant',
+        'content': response.get('content', []),
+        'model': response.get('model', 'router'),
+        'stop_reason': response.get('stop_reason', 'end_turn'),
+        'stop_sequence': response.get('stop_sequence'),
+        'usage': response.get('usage', {'input_tokens': 0, 'output_tokens': 0}),
+    }
+
+
+def iter_anthropic_messages_response(response: Dict[str, Any]) -> Iterator[str]:
+    """Wrap a completed response in Anthropic Messages SSE stream format."""
+    clean = anthropic_messages_response(response)
+    message_start = dict(clean)
+    message_start['content'] = []
+    message_start['stop_reason'] = None
+    message_start['usage'] = {'input_tokens': clean['usage'].get('input_tokens', 0), 'output_tokens': 0}
+    yield _sse_event('message_start', {'type': 'message_start', 'message': message_start})
+
+    for index, block in enumerate(clean.get('content') or []):
+        block_type = block.get('type')
+        if block_type == 'text':
+            yield _sse_event('content_block_start', {
+                'type': 'content_block_start', 'index': index,
+                'content_block': {'type': 'text', 'text': ''},
+            })
+            text = block.get('text', '')
+            if text:
+                yield _sse_event('content_block_delta', {
+                    'type': 'content_block_delta', 'index': index,
+                    'delta': {'type': 'text_delta', 'text': text},
+                })
+            yield _sse_event('content_block_stop', {'type': 'content_block_stop', 'index': index})
+        elif block_type == 'tool_use':
+            yield _sse_event('content_block_start', {
+                'type': 'content_block_start', 'index': index,
+                'content_block': {'type': 'tool_use', 'id': block.get('id', ''), 'name': block.get('name', ''), 'input': {}},
+            })
+            input_json = json.dumps(block.get('input', {}), ensure_ascii=False)
+            if input_json:
+                yield _sse_event('content_block_delta', {
+                    'type': 'content_block_delta', 'index': index,
+                    'delta': {'type': 'input_json_delta', 'partial_json': input_json},
+                })
+            yield _sse_event('content_block_stop', {'type': 'content_block_stop', 'index': index})
+
+    yield _sse_event('message_delta', {
+        'type': 'message_delta',
+        'delta': {'stop_reason': clean['stop_reason'], 'stop_sequence': clean.get('stop_sequence')},
+        'usage': {'output_tokens': clean['usage'].get('output_tokens', 0)},
+    })
+    yield _sse_event('message_stop', {'type': 'message_stop'})
+
+
+def iter_anthropic_messages_progress(events: Iterable[Dict[str, Any]], request: Optional[Dict[str, Any]] = None) -> Iterator[str]:
+    """Convert streaming internal events to Anthropic Messages SSE stream with keepalive."""
+    model = (request or {}).get('model') or 'router'
+    message_shell = {
+        'id': 'msg_router_local', 'type': 'message', 'role': 'assistant',
+        'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None,
+        'usage': {'input_tokens': 0, 'output_tokens': 0},
+    }
+    yield _sse_event('message_start', {'type': 'message_start', 'message': message_shell})
+
+    content_index = 0
+    text_started = False
+    event_queue: Queue[tuple[str, Any]] = Queue()
+
+    def _produce() -> None:
+        try:
+            for event in events:
+                event_queue.put(('event', event))
+        except BaseException as exc:
+            event_queue.put(('error', exc))
+        finally:
+            event_queue.put(('done', None))
+
+    producer = Thread(target=_produce, daemon=True)
+    producer.start()
+
+    while True:
+        try:
+            item_type, item = event_queue.get(timeout=_SSE_KEEPALIVE_INTERVAL_SECONDS)
+        except Empty:
+            yield _sse_comment('keepalive')
+            continue
+
+        if item_type == 'done':
+            break
+        if item_type == 'error':
+            raise item
+
+        event = item
+
+        if event.get('type') == 'progress':
+            yield _sse_comment(event.get('message', 'processing'))
+            continue
+
+        if event.get('type') == 'text_delta':
+            if not text_started:
+                text_started = True
+                yield _sse_event('content_block_start', {
+                    'type': 'content_block_start', 'index': content_index,
+                    'content_block': {'type': 'text', 'text': ''},
+                })
+            delta = event.get('delta', '')
+            if delta:
+                yield _sse_event('content_block_delta', {
+                    'type': 'content_block_delta', 'index': content_index,
+                    'delta': {'type': 'text_delta', 'text': delta},
+                })
+            continue
+
+        if event.get('type') == 'tool_calls':
+            if text_started:
+                yield _sse_event('content_block_stop', {'type': 'content_block_stop', 'index': content_index})
+                content_index += 1
+                text_started = False
+            for tool_call in event.get('tool_calls') or []:
+                func = tool_call.get('function', {})
+                tool_id = tool_call.get('id') or f'toolu_{content_index}'
+                yield _sse_event('content_block_start', {
+                    'type': 'content_block_start', 'index': content_index,
+                    'content_block': {'type': 'tool_use', 'id': tool_id, 'name': func.get('name', ''), 'input': {}},
+                })
+                arguments = func.get('arguments', {})
+                partial_json = json.dumps(arguments, ensure_ascii=False) if isinstance(arguments, dict) else str(arguments)
+                yield _sse_event('content_block_delta', {
+                    'type': 'content_block_delta', 'index': content_index,
+                    'delta': {'type': 'input_json_delta', 'partial_json': partial_json},
+                })
+                yield _sse_event('content_block_stop', {'type': 'content_block_stop', 'index': content_index})
+                content_index += 1
+            continue
+
+        if event.get('type') == 'final':
+            response = event.get('response', {})
+            if text_started:
+                yield _sse_event('content_block_stop', {'type': 'content_block_stop', 'index': content_index})
+                content_index += 1
+                text_started = False
+            usage = response.get('usage', {})
+            stop_reason = response.get('stop_reason', 'end_turn')
+            yield _sse_event('message_delta', {
+                'type': 'message_delta',
+                'delta': {'stop_reason': stop_reason, 'stop_sequence': response.get('stop_sequence')},
+                'usage': {'output_tokens': usage.get('output_tokens', 0)},
+            })
+            yield _sse_event('message_stop', {'type': 'message_stop'})
+            return
+
+        if event.get('type') == 'failed':
+            if text_started:
+                yield _sse_event('content_block_stop', {'type': 'content_block_stop', 'index': content_index})
+            yield _sse_event('message_delta', {
+                'type': 'message_delta',
+                'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
+                'usage': {'output_tokens': 0},
+            })
+            yield _sse_event('message_stop', {'type': 'message_stop'})
+            return
+
+    # Stream ended without final event — close gracefully
+    if text_started:
+        yield _sse_event('content_block_stop', {'type': 'content_block_stop', 'index': content_index})
+    yield _sse_event('message_delta', {
+        'type': 'message_delta',
+        'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
+        'usage': {'output_tokens': 0},
+    })
+    yield _sse_event('message_stop', {'type': 'message_stop'})
+
+
 def ollama_chat_response(response: Dict[str, Any]) -> Dict[str, Any]:
     text, tool_calls = _response_parts(response)
     raw_backend = response.get('raw_backend') or {}

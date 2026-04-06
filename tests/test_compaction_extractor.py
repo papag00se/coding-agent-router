@@ -6,7 +6,7 @@ from unittest import mock
 
 from app.compaction.extractor import CompactionExtractor
 from app.compaction.models import TranscriptChunk
-from app.compaction.prompts import EXTRACTION_SYSTEM_PROMPT, build_extraction_payload
+from app.compaction.prompts import EXTRACTION_SYSTEM_PROMPT, build_extraction_payload, estimate_extraction_request_tokens
 
 
 class _FakeClient:
@@ -64,6 +64,20 @@ class TestCompactionExtractor(unittest.TestCase):
         self.assertEqual(extractor._response_token_budget(14336), 1792)
         self.assertEqual(extractor._response_token_budget(15000), 1128)
         self.assertEqual(extractor._response_token_budget(17000), 0)
+
+    def test_extract_chunk_token_estimation_counts_structured_response_schema(self):
+        chunk = TranscriptChunk(chunk_id=1, start_index=0, end_index=1, token_count=10, items=[{"role": "user", "content": "hello"}])
+
+        with mock.patch("app.compaction.prompts.estimate_model_tokens", return_value=123) as estimate_model_tokens:
+            estimate_extraction_request_tokens(chunk, {"repo": "coding-agent-router"}, model="qwen-test")
+
+        request = estimate_model_tokens.call_args.args[0]
+        self.assertEqual(request["model"], "qwen-test")
+        self.assertEqual(request["instructions"], EXTRACTION_SYSTEM_PROMPT)
+        self.assertEqual(request["store"], False)
+        self.assertTrue(request["stream"])
+        self.assertEqual(request["text"]["format"]["schema"]["title"], "ChunkExtraction")
+        self.assertEqual(request["input"][0]["content"][0]["text"], build_extraction_payload(chunk, {"repo": "coding-agent-router"}))
 
     def test_extract_chunk_uses_burst_context_when_default_window_would_starve_output(self):
         client = _FakeClient('{"objective":"ok"}')

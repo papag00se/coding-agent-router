@@ -18,7 +18,10 @@ from .compaction.normalize import sanitize_inline_compaction_payload
 from .compaction.refiner import CompactionRefiner
 from .compaction_transport import compaction_payload_fields, record_transport_event
 from .compat import (
+    anthropic_messages_response,
     anthropic_request_from_responses,
+    iter_anthropic_messages_progress,
+    iter_anthropic_messages_response,
     iter_responses_progress,
     ollama_tags_response,
     ollama_version_response,
@@ -27,7 +30,7 @@ from .compat import (
 )
 from .config import settings
 from .inline_compaction_jobs import InlineCompactionJobManager, inline_compaction_request_key
-from .models import CompactRequest, InvokeRequest
+from .models import AnthropicMessagesRequest, CompactRequest, InvokeRequest
 from .router import RoutingService
 from .spark_quota import SparkQuotaState, is_spark_quota_error, spark_quota_state_path
 from .task_metrics import estimate_openai_tokens, estimate_tokens
@@ -118,6 +121,33 @@ def _log_inline_compaction_stream(events: Iterable[Dict[str, Any]], payload: Dic
         yield event
 
 
+def _log_anthropic_inline_compaction_stream(events: Iterable[Dict[str, Any]], payload: Dict[str, Any], *, request_key: str) -> Iterable[Dict[str, Any]]:
+    request_tokens = _anthropic_request_tokens(payload)
+    local_model = _inline_compaction_local_model()
+    for event in events:
+        if event.get('type') == 'final':
+            response = event.get('response')
+            _record_transport_event(
+                'anthropic_inline_compaction_completed',
+                path='/v1/messages',
+                request_key=request_key,
+                stream=True,
+                request_tokens=request_tokens,
+                **compaction_payload_fields(after=response),
+            )
+        if event.get('type') == 'failed':
+            _record_transport_event(
+                'anthropic_inline_compaction_failed',
+                path='/v1/messages',
+                request_key=request_key,
+                stream=True,
+                request_tokens=request_tokens,
+                local_model=local_model,
+                error=str(event.get('message') or 'anthropic inline compaction failed'),
+            )
+        yield event
+
+
 def _unsupported_transport_response(transport: str) -> JSONResponse:
     _record_transport_event(
         'unsupported_transport',
@@ -197,6 +227,53 @@ def _auth_header_kind(headers: Dict[str, str]) -> str:
     if value.startswith('Bearer '):
         return 'bearer'
     return 'other'
+
+
+def _anthropic_proxy_url(path: str) -> str:
+    return f"{settings.anthropic_passthrough_base_url.rstrip('/')}{path}"
+
+
+def _is_anthropic_inline_compaction(payload: Dict[str, Any]) -> bool:
+    if _contains_sentinel(payload.get('system')):
+        return True
+    messages = payload.get('messages')
+    if not isinstance(messages, list):
+        return False
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get('role') != 'user':
+            continue
+        return _contains_sentinel(msg.get('content'))
+    return False
+
+
+def _anthropic_request_tokens(payload: Dict[str, Any]) -> int:
+    return max(0, estimate_tokens(payload))
+
+
+def _anthropic_proxy_response(request: Request, path: str, payload: Dict[str, Any]) -> Response:
+    headers = _proxy_headers(request)
+    stream = bool(payload.get('stream'))
+    url = _anthropic_proxy_url(path)
+    upstream = _UPSTREAM.post(
+        url,
+        json=payload,
+        headers=headers,
+        timeout=(settings.ollama_connect_timeout_seconds, settings.codex_timeout_seconds),
+        stream=stream,
+    )
+    _record_transport_event(
+        'anthropic_passthrough',
+        path=path,
+        upstream_url=url,
+        stream=stream,
+        status=upstream.status_code,
+        auth_header=_auth_header_kind(headers),
+        original_model=payload.get('model'),
+        request_tokens=_anthropic_request_tokens(payload),
+    )
+    return _upstream_response_to_starlette(upstream, stream=stream)
 
 
 def _payload_contains_image_input(payload: Dict[str, Any]) -> bool:
@@ -335,6 +412,7 @@ def _stream_spark_inline_compaction_fallback(
 
 
 inline_compaction_jobs.fallback_callback = _stream_spark_inline_compaction_fallback
+anthropic_inline_compaction_jobs = InlineCompactionJobManager(service)
 
 
 def _upstream_response_to_starlette(upstream: requests.Response, *, stream: bool) -> Response:
@@ -1018,6 +1096,8 @@ def health() -> dict:
         "coder_model": settings.coder_model,
         "reasoner_model": settings.reasoner_model,
         "codex_cli_enabled": settings.enable_codex_cli,
+        "openai_passthrough": settings.openai_passthrough_base_url,
+        "anthropic_passthrough": settings.anthropic_passthrough_base_url,
     }
 
 
@@ -1086,9 +1166,73 @@ def compact(req: CompactRequest):
     return JSONResponse(handoff)
 
 
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(request: Request):
+    payload = await request.json()
+    return _anthropic_proxy_response(request, '/v1/messages/count_tokens', payload)
+
+
 @app.post("/v1/messages")
-def anthropic_messages(_: Dict[str, Any]):
-    return _unsupported_transport_response('v1_messages')
+async def anthropic_messages(request: Request):
+    payload = await request.json()
+    if _is_anthropic_inline_compaction(payload):
+        job_key = inline_compaction_request_key(payload)
+        local_model = _inline_compaction_local_model()
+        request_tokens = _anthropic_request_tokens(payload)
+        _record_transport_event(
+            'anthropic_inline_compaction_detected',
+            path='/v1/messages',
+            request_key=job_key,
+            stream=bool(payload.get('stream')),
+            local_model=local_model,
+            request_tokens=request_tokens,
+            **compaction_payload_fields(before=payload),
+        )
+        anthropic_req = AnthropicMessagesRequest.model_validate(payload)
+        job, created = anthropic_inline_compaction_jobs.get_or_create(
+            payload,
+            anthropic_req,
+            headers=_proxy_headers(request),
+        )
+        _record_transport_event(
+            'anthropic_inline_compaction_job_started' if created else 'anthropic_inline_compaction_job_reused',
+            path='/v1/messages',
+            request_key=job.key,
+            stream=bool(payload.get('stream')),
+            local_model=local_model,
+            request_tokens=request_tokens,
+        )
+        if payload.get('stream'):
+            return StreamingResponse(
+                iter_anthropic_messages_progress(
+                    _log_anthropic_inline_compaction_stream(job.iter_events(), payload, request_key=job.key),
+                    payload,
+                ),
+                media_type='text/event-stream',
+            )
+        try:
+            response = job.wait()
+        except RuntimeError as exc:
+            _record_transport_event(
+                'anthropic_inline_compaction_failed',
+                path='/v1/messages',
+                request_key=job.key,
+                stream=False,
+                local_model=local_model,
+                request_tokens=request_tokens,
+                error=str(exc),
+            )
+            return _anthropic_proxy_response(request, '/v1/messages', payload)
+        _record_transport_event(
+            'anthropic_inline_compaction_completed',
+            path='/v1/messages',
+            request_key=job.key,
+            stream=False,
+            request_tokens=request_tokens,
+            **compaction_payload_fields(after=response),
+        )
+        return JSONResponse(anthropic_messages_response(response))
+    return _anthropic_proxy_response(request, '/v1/messages', payload)
 
 
 @app.post("/v1/chat/completions")

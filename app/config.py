@@ -55,6 +55,7 @@ class Settings:
     log_compaction_payloads: bool = _bool("LOG_COMPACTION_PAYLOADS", False)
     inline_compact_sentinel: str = os.getenv("INLINE_COMPACT_SENTINEL", "<<<LOCAL_COMPACT>>>")
     openai_passthrough_base_url: str = os.getenv("OPENAI_PASSTHROUGH_BASE_URL", "https://chatgpt.com/backend-api/codex")
+    anthropic_passthrough_base_url: str = os.getenv("ANTHROPIC_PASSTHROUGH_BASE_URL", "https://api.anthropic.com")
     codex_spark_model: str = os.getenv("CODEX_SPARK_MODEL", "gpt-5.3-codex-spark")
     codex_spark_qualified_rate: float = min(1.0, max(0.0, float(os.getenv("CODEX_SPARK_QUALIFIED_RATE", "0.2"))))
     codex_mini_model: str = os.getenv("CODEX_MINI_MODEL", "gpt-5.4-mini")

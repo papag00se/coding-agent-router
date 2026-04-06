@@ -35,18 +35,13 @@ class ResponsesClient:
     ) -> Dict[str, Any]:
         del temperature, num_ctx, think, tools
 
-        payload: Dict[str, Any] = {
-            "model": model,
-            "input": _responses_input(messages),
-            "store": False,
-            "stream": True,
-        }
-        if system:
-            payload["instructions"] = system
-        if max_tokens is not None:
-            payload["max_output_tokens"] = max_tokens
-        if isinstance(response_format, dict):
-            payload["text"] = {"format": _json_schema_text_format(response_format)}
+        payload = build_chat_request_payload(
+            model,
+            messages,
+            system=system,
+            max_tokens=max_tokens,
+            response_format=response_format,
+        )
 
         with self.session.post(
             f"{self.base_url}/responses",
@@ -70,6 +65,31 @@ class ResponsesClient:
             "eval_count": usage.get("output_tokens", 0),
             "raw_response": body,
         }
+
+
+def build_chat_request_payload(
+    model: str,
+    messages: List[Dict[str, Any]],
+    *,
+    system: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    response_format: Optional[Union[str, Dict[str, Any]]] = None,
+    store: bool = False,
+    stream: bool = True,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "model": model,
+        "input": _responses_input(messages),
+        "store": store,
+        "stream": stream,
+    }
+    if system:
+        payload["instructions"] = system
+    if max_tokens is not None:
+        payload["max_output_tokens"] = max_tokens
+    if isinstance(response_format, dict):
+        payload["text"] = {"format": _json_schema_text_format(response_format)}
+    return payload
 
 
 def _read_streaming_response_body(response: requests.Response) -> Dict[str, Any]:

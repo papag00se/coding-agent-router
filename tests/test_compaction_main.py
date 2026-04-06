@@ -863,18 +863,126 @@ class TestCompactionMain(unittest.TestCase):
         self.assertIn('Unsupported transport', response.json()['error'])
         self.assertEqual(service.compact_calls, [])
 
-    def test_anthropic_messages_is_explicitly_unsupported(self):
+    def test_anthropic_messages_proxied_upstream(self):
         service = DummyCompactionService()
-        with patch.object(compaction_main, 'service', service):
+        with patch.object(compaction_main, 'service', service), \
+             patch.object(compaction_main, '_UPSTREAM') as mock_upstream:
+            mock_resp = unittest.mock.MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.content = b'{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}'
+            mock_resp.headers = {'content-type': 'application/json'}
+            mock_upstream.post.return_value = mock_resp
             client = TestClient(compaction_main.app)
             response = client.post(
                 '/v1/messages',
                 json={
-                    'model': 'gpt-5.4',
+                    'model': 'claude-sonnet-4-6-20250514',
                     'messages': [{'role': 'user', 'content': 'Check the repo'}],
                 },
             )
 
-        self.assertEqual(response.status_code, 409)
-        self.assertIn('Unsupported transport', response.json()['error'])
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(service.compact_calls, [])
+        mock_upstream.post.assert_called_once()
+        call_url = mock_upstream.post.call_args[0][0]
+        self.assertIn('/v1/messages', call_url)
+
+    def test_anthropic_messages_sentinel_triggers_compaction(self):
+        """Requests with the compaction sentinel in user message should be handled locally."""
+        service = DummyCompactionService()
+        service.compact_result = {
+            'task_state': 'working', 'decisions': [], 'failures': [],
+            'next_steps': [], 'structured_handoff': {},
+        }
+        service.handoff_flow_result = {
+            'durable_memory': [{'name': 'TASK_STATE.md', 'content': 'test'}],
+            'structured_handoff': {},
+        }
+        with patch.object(compaction_main, 'service', service), \
+             patch.object(compaction_main, 'anthropic_inline_compaction_jobs') as mock_jobs:
+            mock_job = unittest.mock.MagicMock()
+            mock_job.key = 'test_key'
+            mock_job.wait.return_value = {
+                'id': 'msg_router_local', 'type': 'message', 'role': 'assistant',
+                'model': 'qwen3.5:9b',
+                'content': [{'type': 'text', 'text': 'compacted summary'}],
+                'stop_reason': 'end_turn', 'stop_sequence': None,
+                'usage': {'input_tokens': 100, 'output_tokens': 50},
+            }
+            mock_jobs.get_or_create.return_value = (mock_job, True)
+            client = TestClient(compaction_main.app)
+            response = client.post(
+                '/v1/messages',
+                json={
+                    'model': 'claude-sonnet-4-6-20250514',
+                    'max_tokens': 1024,
+                    'messages': [
+                        {'role': 'user', 'content': 'Hello'},
+                        {'role': 'assistant', 'content': 'Hi there'},
+                        {'role': 'user', 'content': '<<<LOCAL_COMPACT>>>'},
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['type'], 'message')
+        self.assertEqual(body['content'][0]['text'], 'compacted summary')
+        mock_jobs.get_or_create.assert_called_once()
+
+    def test_anthropic_messages_sentinel_in_system_triggers_compaction(self):
+        """Sentinel in system prompt should also trigger compaction."""
+        service = DummyCompactionService()
+        with patch.object(compaction_main, 'service', service), \
+             patch.object(compaction_main, 'anthropic_inline_compaction_jobs') as mock_jobs:
+            mock_job = unittest.mock.MagicMock()
+            mock_job.key = 'test_key'
+            mock_job.wait.return_value = {
+                'id': 'msg_router_local', 'type': 'message', 'role': 'assistant',
+                'model': 'qwen3.5:9b',
+                'content': [{'type': 'text', 'text': 'compacted'}],
+                'stop_reason': 'end_turn', 'stop_sequence': None,
+                'usage': {'input_tokens': 50, 'output_tokens': 20},
+            }
+            mock_jobs.get_or_create.return_value = (mock_job, True)
+            client = TestClient(compaction_main.app)
+            response = client.post(
+                '/v1/messages',
+                json={
+                    'model': 'claude-sonnet-4-6-20250514',
+                    'max_tokens': 1024,
+                    'system': 'You are helpful. <<<LOCAL_COMPACT>>>',
+                    'messages': [{'role': 'user', 'content': 'Continue'}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_jobs.get_or_create.assert_called_once()
+
+    def test_anthropic_compaction_failure_falls_back_to_upstream(self):
+        """If local compaction fails, should fall back to proxying upstream."""
+        service = DummyCompactionService()
+        with patch.object(compaction_main, 'service', service), \
+             patch.object(compaction_main, 'anthropic_inline_compaction_jobs') as mock_jobs, \
+             patch.object(compaction_main, '_UPSTREAM') as mock_upstream:
+            mock_job = unittest.mock.MagicMock()
+            mock_job.key = 'test_key'
+            mock_job.wait.side_effect = RuntimeError('compaction failed')
+            mock_jobs.get_or_create.return_value = (mock_job, True)
+            mock_resp = unittest.mock.MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.content = b'{"id":"msg_1","type":"message","content":[{"type":"text","text":"upstream"}]}'
+            mock_resp.headers = {'content-type': 'application/json'}
+            mock_upstream.post.return_value = mock_resp
+            client = TestClient(compaction_main.app)
+            response = client.post(
+                '/v1/messages',
+                json={
+                    'model': 'claude-sonnet-4-6-20250514',
+                    'max_tokens': 1024,
+                    'messages': [{'role': 'user', 'content': '<<<LOCAL_COMPACT>>>'}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_upstream.post.assert_called_once()

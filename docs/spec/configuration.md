@@ -47,6 +47,7 @@ Configuration is loaded from environment variables through [`app/config.py`](/ho
 - `LOG_COMPACTION_PAYLOADS`
 - `INLINE_COMPACT_SENTINEL`
 - `OPENAI_PASSTHROUGH_BASE_URL`
+- `ANTHROPIC_PASSTHROUGH_BASE_URL`
 - `CODEX_MINI_MODEL`
 - `CODEX_SPARK_MODEL`
 - `CODEX_SPARK_QUALIFIED_RATE`
@@ -64,6 +65,8 @@ These exist in config but are not operationally significant in the current runti
 
 `OPENAI_PASSTHROUGH_BASE_URL` is the hosted Codex/OpenAI upstream for ordinary non-compaction traffic when the compaction companion is used as an OAuth proxy. In ChatGPT-auth mode, that should normally be `https://chatgpt.com/backend-api/codex`.
 
+`ANTHROPIC_PASSTHROUGH_BASE_URL` is the upstream Anthropic API for non-compaction Claude Code traffic (default `https://api.anthropic.com`). Set `ANTHROPIC_BASE_URL` in your Claude Code environment to point at the companion service, and non-compaction requests will be proxied upstream through this URL. Requests containing the inline compaction sentinel are handled locally via the shared Ollama queue.
+
 Local Ollama requests are serialized per `base_url` by the client gate. `OLLAMA_POOL_CONNECTIONS` and `OLLAMA_POOL_MAXSIZE` only tune HTTP connection reuse.
 
 `LOG_COMPACTION_PAYLOADS=true` adds full before and after compaction payloads to `state/compaction_transport.jsonl`. Leave it off unless you explicitly want raw payloads on disk.
@@ -76,7 +79,7 @@ Transport and rewrite counters are persisted separately in `state/compaction_met
 
 `COMPACTOR_MAX_CHUNK_TOKENS` is a legacy compatibility knob. In the current runtime it cannot raise extraction chunk size above `COMPACTOR_TARGET_CHUNK_TOKENS`; the effective hard chunk limit is the lower of the two values.
 
-`COMPACTOR_MAX_PROMPT_TOKENS` is the hard ceiling for the full extraction/refinement request estimate, including system prompt and JSON envelope. The current default is `12256`, which keeps compaction well below `12k` prompt tokens plus the existing small estimation slack.
+`COMPACTOR_MAX_PROMPT_TOKENS` is the hard ceiling for the full extraction/refinement request estimate, including the system prompt, the compact transcript payload, and the strict structured-output JSON schema. The current default is `12256`, which keeps compaction well below the upstream request limit once the request envelope is counted.
 
 Refinement also has a built-in per-iteration cap of about `8000` recent-raw tokens. That cap is code-level behavior, not an environment-variable knob.
 

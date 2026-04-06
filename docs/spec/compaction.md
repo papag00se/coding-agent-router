@@ -58,7 +58,7 @@ Behavior:
 - preserves chronology while stripping tool-call wrapper noise such as `type`, `id`, `yield_time_ms`, and `max_output_tokens`
 - encodes empty `write_stdin` polls as compact `poll` events instead of empty input blobs
 - supplies a strict extraction system prompt
-- estimates full request size with a tokenizer-based prompt counter
+- estimates the full upstream `/responses` request envelope, including the strict JSON schema, with a tokenizer-based prompt counter
 - keeps `COMPACTOR_NUM_CTX` as the normal request context but may burst to `COMPACTOR_BURST_NUM_CTX`
 - keeps the estimated full extraction request at or under `COMPACTOR_MAX_PROMPT_TOKENS`
 - avoids requests that cannot fit an estimated safe request budget within context
@@ -88,7 +88,7 @@ Behavior:
 - takes deterministic merged state as the source of truth
 - extracts recent-turn durable state and merges it deterministically onto the existing merged state
 - sends recent raw turns to the refiner as the same compact ordered event stream used by extraction
-- estimates full request size with a tokenizer-based prompt counter
+- estimates the full upstream `/responses` request envelope, including the strict JSON schema, with a tokenizer-based prompt counter
 - keeps the estimated full refinement request at or under `COMPACTOR_MAX_PROMPT_TOKENS`
 - constrains refinement output with a strict recent-state extraction schema instead of a diff/patch schema
 - represents `repo_state` facts as key/value entry arrays in model output, then normalizes them back into runtime dictionaries

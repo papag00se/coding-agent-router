@@ -4,9 +4,11 @@ import json
 from typing import Any, Dict, List, Optional
 
 from ..config import settings
+from ..clients.responses_client import build_chat_request_payload
 from ..prompt_loader import load_prompt
 from ..task_metrics import estimate_model_tokens
 from .models import ChunkExtraction, MergedState, TranscriptChunk
+from .structured_output import chunk_extraction_response_schema, recent_state_response_schema
 
 
 EXTRACTION_SYSTEM_PROMPT = load_prompt('compaction_extraction_system.md')
@@ -36,11 +38,13 @@ def estimate_extraction_request_tokens(
     model: Optional[str] = None,
 ) -> int:
     payload = build_extraction_payload(chunk, repo_context)
-    messages = [
-        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-        {"role": "user", "content": payload},
-    ]
-    return estimate_model_tokens(messages, model=model or settings.compactor_model)
+    request = build_chat_request_payload(
+        model or settings.compactor_model,
+        [{"role": "user", "content": payload}],
+        system=EXTRACTION_SYSTEM_PROMPT,
+        response_format=chunk_extraction_response_schema(),
+    )
+    return estimate_model_tokens(request, model=model or settings.compactor_model)
 
 
 def build_refinement_payload(
@@ -79,11 +83,13 @@ def estimate_refinement_request_tokens(
     model: Optional[str] = None,
 ) -> int:
     payload = build_refinement_payload(state, recent_raw_turns, current_request, repo_context)
-    messages = [
-        {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
-        {"role": "user", "content": payload},
-    ]
-    return estimate_model_tokens(messages, model=model or settings.compactor_model)
+    request = build_chat_request_payload(
+        model or settings.compactor_model,
+        [{"role": "user", "content": payload}],
+        system=REFINEMENT_SYSTEM_PROMPT,
+        response_format=recent_state_response_schema(),
+    )
+    return estimate_model_tokens(request, model=model or settings.compactor_model)
 
 
 def _compact_chunk_payload(chunk: TranscriptChunk) -> Dict[str, Any]:
