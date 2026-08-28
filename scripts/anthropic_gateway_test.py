@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-base_url = os.getenv("TEST_SERVER_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
+base_url = os.getenv("TEST_SERVER_BASE_URL", "http://127.0.0.1:9091").rstrip("/")
 prompt = (Path(__file__).resolve().parent / "prompts" / "01_local_reasoning.txt").read_text(encoding="utf-8")
 
 payload = {

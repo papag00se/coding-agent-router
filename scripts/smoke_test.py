@@ -14,7 +14,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("prompt_file", help="Path to a .txt prompt file, for example scripts/prompts/01_local_reasoning.txt")
     parser.add_argument("--preferred-backend", default=None)
-    parser.add_argument("--base-url", default=os.getenv("TEST_SERVER_BASE_URL", "http://127.0.0.1:8080"))
+    parser.add_argument("--base-url", default=os.getenv("TEST_SERVER_BASE_URL", "http://127.0.0.1:9091"))
     args = parser.parse_args()
 
     prompt = Path(args.prompt_file).read_text(encoding="utf-8")
